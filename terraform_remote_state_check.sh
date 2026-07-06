@@ -6,6 +6,16 @@
 #   S3バックエンドに保存された他チーム管理のTerraformリモートステートを、
 #   terraform_remote_state データソース経由で実際に読み取り、
 #   データソース定義の動作確認および output キーの検索・選択・値取得を行う。
+#   --state-key を省略した場合は、バケットに配置されている全ファイルを
+#   参照対象として terraform_remote_state データソースを一括生成する。
+#   データソース名は --name-template (既定: INFRA_{dir1}_{dir2}) で決定する。
+#
+# 安全方針 (読み取り専用):
+#   - ステートは常にローカルステート (一時作業ディレクトリ内) を使用する。
+#     指定 .tf に backend 定義があっても backend_override.tf で local に強制する。
+#   - resource / module ブロックを含む .tf ファイルは受け付けない。
+#   - apply 前に plan 結果を検査し、リソースの作成・変更・削除が 1 件でも
+#     含まれる場合は中止する (リモートステートの読み取りのみを許可)。
 #
 # 対象環境: RHEL9 (EC2), bash 5.x, Terraform 1.x, AWS CLI v2, jq
 #
@@ -17,7 +27,7 @@ set -euo pipefail
 # 定数・グローバル変数
 #-------------------------------------------------------------------------------
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly EXIT_OK=0
 readonly EXIT_PARAM_ERROR=2
 readonly EXIT_AUTH_ERROR=3
@@ -40,6 +50,7 @@ TF_DATA_SOURCE_FILE=""
 SWITCHBACK_SHELL_PATH=""
 AUTO_SWITCHBACK="false"
 COMMON_SH_PATH=""
+NAME_TEMPLATE="INFRA_{dir1}_{dir2}"
 DEBUG="false"
 KEEP_WORKDIR="false"
 
@@ -47,6 +58,11 @@ KEEP_WORKDIR="false"
 WORKDIR=""
 TF_VERSION=""
 SWITCHBACK_EXECUTED="false"
+ALL_STATES="false"          # --state-key 省略時: バケット内全ファイルを対象にする
+DATA_SOURCE_NAME_SET="false" # --data-source-name が明示指定されたか
+SELECTED_DS=""              # 値取得対象のデータソース名
+DS_NAMES=()                 # 生成した全データソース名 (定義順)
+declare -A DS_S3KEYS=()     # データソース名 -> S3 オブジェクトキー
 
 # Terraform を非対話モードで実行する
 export TF_IN_AUTOMATION=1
@@ -165,6 +181,32 @@ check_aws_permission() {
             return 1
         fi
         log_info "assume role 権限確認 OK"
+        return 0
+    fi
+
+    # バケット全体参照モードの場合は、一覧取得 (ListBucket) 権限を確認する
+    if [[ "${ALL_STATES}" == "true" ]]; then
+        log_info "S3 バケットの一覧取得権限を確認しています (s3://${BUCKET}) ..."
+        if ! err="$(aws_cli s3api list-objects-v2 \
+                        --bucket "${BUCKET}" \
+                        --region "${REGION}" \
+                        --max-items 1 2>&1 >/dev/null)"; then
+            log_debug "list-objects-v2 失敗: ${err}"
+            if grep -qiE 'NoSuchBucket' <<<"${err}"; then
+                die "${EXIT_GENERIC_ERROR}" \
+                    "S3 バケット '${BUCKET}' が存在しません。--bucket の指定を確認してください。"
+            fi
+            if grep -qiE 'ExpiredToken|InvalidClientTokenId' <<<"${err}"; then
+                die "${EXIT_AUTH_ERROR}" \
+                    "aws login --remote による認証が完了していない、または認証期限が切れています。aws login --remote を実行してから再度実行してください。"
+            fi
+            if grep -qiE '403|AccessDenied|Forbidden' <<<"${err}"; then
+                log_warn "現在の操作権限では S3 バケット s3://${BUCKET} の一覧取得ができません。"
+                return 1
+            fi
+            die "${EXIT_GENERIC_ERROR}" "S3 一覧取得確認で想定外のエラーが発生しました: ${err}"
+        fi
+        log_info "S3 一覧取得権限確認 OK"
         return 0
     fi
 
@@ -298,28 +340,51 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   S3 バックエンドの Terraform リモートステートを terraform_remote_state
   データソースで実際に読み取り、定義の動作確認と output 値の取得を行います。
 
+安全方針 (読み取り専用):
+  - ステートは常にローカル (一時作業ディレクトリ内) を使用します。指定 .tf に
+    backend 定義があっても backend_override.tf でローカルに強制されます。
+  - resource / module ブロックを含む .tf ファイルは受け付けません。
+  - apply 前に plan を検査し、リソースの作成・変更・削除が含まれる場合は
+    中止します。リモートステートおよび AWS リソースへの書き込みは行いません。
+
 使用方法:
   ${SCRIPT_NAME} [オプション]
 
 動作モード:
   A) データソースコード検証モード:
      --terraform-data-source-file で既存の .tf 定義を渡して動作確認します。
-  B) パラメータ生成モード:
+  B) パラメータ生成モード (単一ステート):
      --bucket / --state-key / --region から定義を自動生成します。
+  C) バケット全体参照モード:
+     --state-key を省略すると、バケットに配置されている全ファイルを参照対象に
+     terraform_remote_state データソースを一括生成します。
+     データソース名は --name-template (既定: INFRA_{dir1}_{dir2}) で決まります。
   いずれのモードでも、以下を組み合わせられます:
      --output-key : 指定キーの値を直接取得
      --search     : キー候補を検索し、番号選択して値を取得
      (どちらも未指定の場合は、取得可能な output キー一覧を表示)
 
-必須パラメータ (モードB の場合):
+必須パラメータ (モードB/C の場合):
   --bucket <name>            リモートステートの S3 バケット名
-  --state-key <key>          リモートステートファイルのキー (例: network/terraform.tfstate)
   --region <region>          AWS リージョン (例: ap-northeast-1)
+  --state-key <key>          リモートステートファイルのキー (例: network/terraform.tfstate)
+                             省略時はモードCとしてバケット内の全ファイルを対象にします。
 
 任意パラメータ:
   --terraform-data-source-file <path>
                              terraform_remote_state データソース定義 (.tf) ファイル
   --data-source-name <name>  データソース名 (既定: remote_state)
+                             モードCでは --output-key の対象データソースの
+                             絞り込み (同名キーが複数ある場合の指定) に使用します。
+  --name-template <tpl>      モードCでのデータソース名テンプレート
+                             (既定: INFRA_{dir1}_{dir2})
+                             プレースホルダ:
+                               {dir1} {dir2} {dir3} : ステートファイルキーの
+                                                      第1〜第3階層ディレクトリ名
+                               {basename}           : ファイル名 (.tfstate を除く)
+                             Terraform 識別子に使えない文字は '_' に置換し、
+                             空要素による連続 '_' は 1 つに詰められます。
+                             名前が重複した場合は連番 (_2, _3 ...) を付与します。
   --output-key <key>         取得対象の output キー
   --search <string>          output キーの検索文字列 (部分一致・大文字小文字無視)
   --role-arn <arn>           assume role に利用する Role ARN
@@ -346,7 +411,15 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   ${SCRIPT_NAME} --bucket team-a-tfstate --state-key network/terraform.tfstate \\
       --region ap-northeast-1 --search subnet
 
-  # 4) assume role + 自動スイッチバックを併用
+  # 4) バケット内の全ステートファイルを一括参照し、キー一覧を表示 (モードC)
+  #    例: network/prod/terraform.tfstate -> data.terraform_remote_state.INFRA_network_prod
+  ${SCRIPT_NAME} --bucket team-a-tfstate --region ap-northeast-1
+
+  # 5) モードCで命名テンプレートを変更して一括参照
+  ${SCRIPT_NAME} --bucket team-a-tfstate --region ap-northeast-1 \\
+      --name-template 'RS_{dir1}_{dir2}_{basename}'
+
+  # 6) assume role + 自動スイッチバックを併用
   ${SCRIPT_NAME} --bucket team-a-tfstate --state-key network/terraform.tfstate \\
       --region ap-northeast-1 --role-arn arn:aws:iam::123456789012:role/tfstate-read \\
       --external-id my-external-id \\
@@ -367,7 +440,8 @@ parse_args() {
             --bucket)                      BUCKET="${2:?--bucket に値が必要です}"; shift 2 ;;
             --state-key)                   STATE_KEY="${2:?--state-key に値が必要です}"; shift 2 ;;
             --region)                      REGION="${2:?--region に値が必要です}"; shift 2 ;;
-            --data-source-name)            DATA_SOURCE_NAME="${2:?--data-source-name に値が必要です}"; shift 2 ;;
+            --data-source-name)            DATA_SOURCE_NAME="${2:?--data-source-name に値が必要です}"; DATA_SOURCE_NAME_SET="true"; shift 2 ;;
+            --name-template)               NAME_TEMPLATE="${2:?--name-template に値が必要です}"; shift 2 ;;
             --output-key)                  OUTPUT_KEY="${2:?--output-key に値が必要です}"; shift 2 ;;
             --search)                      SEARCH_STRING="${2:?--search に値が必要です}"; shift 2 ;;
             --role-arn)                    ROLE_ARN="${2:?--role-arn に値が必要です}"; shift 2 ;;
@@ -401,14 +475,18 @@ validate_args() {
                 "--terraform-data-source-file で指定されたファイルに読み取り権限がありません: ${TF_DATA_SOURCE_FILE}"
         fi
     else
-        # モードB: パラメータから生成
+        # モードB/C: パラメータから生成
         local missing=()
-        [[ -z "${BUCKET}"    ]] && missing+=("--bucket (S3バケット名)")
-        [[ -z "${STATE_KEY}" ]] && missing+=("--state-key (リモートステートファイルのキー)")
-        [[ -z "${REGION}"    ]] && missing+=("--region (AWSリージョン)")
+        [[ -z "${BUCKET}" ]] && missing+=("--bucket (S3バケット名)")
+        [[ -z "${REGION}" ]] && missing+=("--region (AWSリージョン)")
         if [[ ${#missing[@]} -gt 0 ]]; then
             die "${EXIT_PARAM_ERROR}" \
                 "必須パラメータが不足しています: ${missing[*]}。--terraform-data-source-file を使用しない場合、これらは必須です。--help を参照してください。"
+        fi
+        if [[ -z "${STATE_KEY}" ]]; then
+            # モードC: バケット内の全ファイルを参照対象とする
+            ALL_STATES="true"
+            log_info "--state-key が未指定のため、バケット内の全ファイルを参照対象にします (命名テンプレート: ${NAME_TEMPLATE})"
         fi
     fi
 
@@ -447,6 +525,41 @@ version_ge() {
     [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" == "$2" ]]
 }
 
+#--- 指定 .tf ファイルの安全性チェック (読み取り専用の担保) ---------------------
+# resource / module ブロックを含むファイルは apply でリソースを作成し得るため拒否する。
+# backend 定義は backend_override.tf で local に強制されるが、意図の齟齬を防ぐため警告する。
+check_tf_file_safety() {
+    if grep -qE '^[[:space:]]*resource[[:space:]]+"' "${TF_DATA_SOURCE_FILE}"; then
+        die "${EXIT_PARAM_ERROR}" \
+            "指定ファイルに resource ブロックが含まれています。本スクリプトはリモートステートの読み取り検証専用のため、AWSリソースを作成し得る定義は受け付けません: ${TF_DATA_SOURCE_FILE}"
+    fi
+    if grep -qE '^[[:space:]]*module[[:space:]]+"' "${TF_DATA_SOURCE_FILE}"; then
+        die "${EXIT_PARAM_ERROR}" \
+            "指定ファイルに module ブロックが含まれています。モジュール経由でリソースが作成される可能性があるため受け付けません: ${TF_DATA_SOURCE_FILE}"
+    fi
+    if grep -qE '^[[:space:]]*backend[[:space:]]+"' "${TF_DATA_SOURCE_FILE}"; then
+        log_warn "指定ファイルに backend 定義が含まれていますが、リモートステート保護のため backend_override.tf によりローカルステートに強制されます。"
+    fi
+}
+
+#--- backend_override.tf 生成 ----------------------------------------------------
+# 指定/生成された .tf の内容に関わらず、ステートを一時作業ディレクトリ内の
+# ローカルステートに強制する (他チームのリモートステートを書き換えないための保護)。
+generate_backend_override_tf() {
+    cat >"${WORKDIR}/backend_override.tf" <<EOF
+#-------------------------------------------------------------
+# ${SCRIPT_NAME} により自動生成
+# ステートをローカル (一時作業ディレクトリ内) に強制する保護設定
+#-------------------------------------------------------------
+terraform {
+  backend "local" {
+    path = "terraform.tfstate"
+  }
+}
+EOF
+    log_info "backend_override.tf を生成しました (ステートはローカル固定): ${WORKDIR}/backend_override.tf"
+}
+
 #--- .tf ファイルからデータソース名を抽出 ---------------------------------------
 extract_data_source_name() {
     local names
@@ -468,6 +581,155 @@ extract_data_source_name() {
     log_info "データソース名を検出しました: ${DATA_SOURCE_NAME}"
 }
 
+#--- backend config の追加設定 (profile / assume role) を組み立てる --------------
+build_extra_config() {
+    local extra=""
+    if [[ -n "${AWS_PROFILE_NAME}" ]]; then
+        extra+="
+    profile = \"${AWS_PROFILE_NAME}\""
+    fi
+    if [[ -n "${ROLE_ARN}" ]]; then
+        if version_ge "${TF_VERSION:-0.0.0}" "1.6.0"; then
+            # Terraform 1.6+ では assume_role ブロック形式が推奨
+            extra+="
+    assume_role = {
+      role_arn    = \"${ROLE_ARN}\""
+            if [[ -n "${EXTERNAL_ID}" ]]; then
+                extra+="
+      external_id = \"${EXTERNAL_ID}\""
+            fi
+            extra+="
+    }"
+        else
+            # Terraform 1.5 以前はトップレベル指定
+            extra+="
+    role_arn = \"${ROLE_ARN}\""
+            if [[ -n "${EXTERNAL_ID}" ]]; then
+                extra+="
+    external_id = \"${EXTERNAL_ID}\""
+            fi
+        fi
+    fi
+    printf '%s' "${extra}"
+}
+
+#--- S3 バケット内の全オブジェクトキーを列挙する (JSON配列) ----------------------
+# フォルダマーカー (末尾 "/") は除外する。読み取り操作 (ListBucket) のみ。
+list_all_state_keys() {
+    local json
+    if ! json="$(aws_cli s3api list-objects-v2 \
+                    --bucket "${BUCKET}" \
+                    --region "${REGION}" \
+                    --query 'Contents[].Key' \
+                    --output json 2>"${WORKDIR}/list_err.log")"; then
+        log_error "S3 バケットの一覧取得に失敗しました (s3://${BUCKET})。"
+        tail -n 10 "${WORKDIR}/list_err.log" >&2
+        exit "${EXIT_GENERIC_ERROR}"
+    fi
+    [[ "${json}" == "null" || -z "${json}" ]] && json="[]"
+    jq '[.[] | select(endswith("/") | not)]' <<<"${json}"
+}
+
+#--- S3 キーから命名テンプレートに従いデータソース名を生成する -------------------
+# テンプレートのプレースホルダ: {dir1} {dir2} {dir3} {basename}
+# 例: network/prod/terraform.tfstate + INFRA_{dir1}_{dir2} -> INFRA_network_prod
+build_data_source_name_from_key() {
+    local key="$1"
+    local -a parts
+    IFS='/' read -r -a parts <<<"${key}"
+    local n=${#parts[@]}
+
+    local base="${parts[$((n - 1))]}"
+    base="${base%.tfstate}"
+    local dir1="" dir2="" dir3=""
+    (( n >= 2 )) && dir1="${parts[0]}"
+    (( n >= 3 )) && dir2="${parts[1]}"
+    (( n >= 4 )) && dir3="${parts[2]}"
+
+    local name="${NAME_TEMPLATE}"
+    name="${name//\{dir1\}/${dir1}}"
+    name="${name//\{dir2\}/${dir2}}"
+    name="${name//\{dir3\}/${dir3}}"
+    name="${name//\{basename\}/${base}}"
+
+    # Terraform 識別子として不正な文字を '_' に置換し、空要素による連続 '_' を詰める
+    name="${name//[^A-Za-z0-9_-]/_}"
+    while [[ "${name}" == *__* ]]; do name="${name//__/_}"; done
+    name="${name%_}"
+    # 識別子は数字・ハイフン始まり不可のため補正する
+    [[ ! "${name}" =~ ^[A-Za-z_] ]] && name="_${name}"
+    [[ -z "${name}" || "${name}" == "_" ]] && name="INFRA_state"
+
+    printf '%s' "${name}"
+}
+
+#--- モードC: バケット内全ファイルのデータソース定義を一括生成する ---------------
+generate_main_tf_all_states() {
+    local main_tf="$1"
+
+    log_info "S3 バケット内の全ファイルを列挙しています (s3://${BUCKET}) ..."
+    local keys_json
+    keys_json="$(list_all_state_keys)"
+
+    local total
+    total="$(jq 'length' <<<"${keys_json}")"
+    if [[ "${total}" -eq 0 ]]; then
+        die "${EXIT_GENERIC_ERROR}" \
+            "S3 バケット '${BUCKET}' に参照対象のファイルが1件も存在しません。--bucket の指定を確認してください。"
+    fi
+    log_info "参照対象ステートファイル: ${total} 件 (命名テンプレート: ${NAME_TEMPLATE})"
+
+    local extra_config
+    extra_config="$(build_extra_config)"
+
+    cat >"${main_tf}" <<EOF
+#-------------------------------------------------------------
+# ${SCRIPT_NAME} により自動生成 ($(date '+%Y-%m-%d %H:%M:%S'))
+# 他チーム管理のリモートステート読み取り検証用の定義
+# 対象: s3://${BUCKET} 内の全ファイル (${total} 件)
+# 命名テンプレート: ${NAME_TEMPLATE}
+#-------------------------------------------------------------
+EOF
+
+    local -A used_names=()
+    local key name suffix
+    while IFS= read -r key; do
+        if [[ "${key}" != *.tfstate ]]; then
+            log_warn "拡張子が .tfstate ではないファイルも参照対象に含めます: ${key} (ステートファイルでない場合は読み取りに失敗します)"
+        fi
+
+        name="$(build_data_source_name_from_key "${key}")"
+        if [[ -n "${used_names[${name}]:-}" ]]; then
+            suffix=2
+            while [[ -n "${used_names[${name}_${suffix}]:-}" ]]; do
+                suffix=$((suffix + 1))
+            done
+            log_warn "データソース名が重複したため連番を付与します: ${name} -> ${name}_${suffix} (key: ${key})"
+            name="${name}_${suffix}"
+        fi
+        used_names["${name}"]=1
+        DS_NAMES+=("${name}")
+        DS_S3KEYS["${name}"]="${key}"
+        log_debug "データソース生成: ${name} <- s3://${BUCKET}/${key}"
+
+        cat >>"${main_tf}" <<EOF
+
+# key: ${key}
+data "terraform_remote_state" "${name}" {
+  backend = "s3"
+
+  config = {
+    bucket = "${BUCKET}"
+    key    = "${key}"
+    region = "${REGION}"${extra_config}
+  }
+}
+EOF
+    done < <(jq -r '.[]' <<<"${keys_json}")
+
+    log_info "main.tf を生成しました (データソース ${#DS_NAMES[@]} 件): ${main_tf}"
+}
+
 #--- main.tf 生成 ---------------------------------------------------------------
 generate_main_tf() {
     local main_tf="${WORKDIR}/main.tf"
@@ -475,36 +737,15 @@ generate_main_tf() {
     if [[ -n "${TF_DATA_SOURCE_FILE}" ]]; then
         # モードA: 指定された定義をそのまま利用する
         cp -- "${TF_DATA_SOURCE_FILE}" "${main_tf}"
+        DS_NAMES=("${DATA_SOURCE_NAME}")
         log_info "指定された Terraform データソース定義を使用します: ${TF_DATA_SOURCE_FILE}"
+    elif [[ "${ALL_STATES}" == "true" ]]; then
+        # モードC: バケット内全ファイルを対象に一括生成する
+        generate_main_tf_all_states "${main_tf}"
     else
         # モードB: パラメータから可読性の高い main.tf を生成する
-        local extra_config=""
-        if [[ -n "${AWS_PROFILE_NAME}" ]]; then
-            extra_config+="
-    profile = \"${AWS_PROFILE_NAME}\""
-        fi
-        if [[ -n "${ROLE_ARN}" ]]; then
-            if version_ge "${TF_VERSION:-0.0.0}" "1.6.0"; then
-                # Terraform 1.6+ では assume_role ブロック形式が推奨
-                extra_config+="
-    assume_role = {
-      role_arn    = \"${ROLE_ARN}\""
-                if [[ -n "${EXTERNAL_ID}" ]]; then
-                    extra_config+="
-      external_id = \"${EXTERNAL_ID}\""
-                fi
-                extra_config+="
-    }"
-            else
-                # Terraform 1.5 以前はトップレベル指定
-                extra_config+="
-    role_arn = \"${ROLE_ARN}\""
-                if [[ -n "${EXTERNAL_ID}" ]]; then
-                    extra_config+="
-    external_id = \"${EXTERNAL_ID}\""
-                fi
-            fi
-        fi
+        local extra_config
+        extra_config="$(build_extra_config)"
 
         cat >"${main_tf}" <<EOF
 #-------------------------------------------------------------
@@ -521,6 +762,8 @@ data "terraform_remote_state" "${DATA_SOURCE_NAME}" {
   }
 }
 EOF
+        DS_NAMES=("${DATA_SOURCE_NAME}")
+        DS_S3KEYS["${DATA_SOURCE_NAME}"]="${STATE_KEY}"
         log_info "main.tf を生成しました: ${main_tf}"
     fi
 
@@ -533,29 +776,39 @@ EOF
 
 #--- outputs.tf 生成 ------------------------------------------------------------
 # mode=keys : キー一覧のみを output (値を state/ログに出さないため keys() を使用)
-# mode=value: キー一覧 + 選択キーの値を output
+#             複数データソース対応のため { データソース名 = [キー一覧] } のマップで出力する。
+# mode=value: キー一覧 + 選択データソース (SELECTED_DS) の選択キーの値を output
 generate_outputs_tf() {
     local mode="$1"
     local outputs_tf="${WORKDIR}/outputs.tf"
+    local name
 
-    cat >"${outputs_tf}" <<EOF
+    {
+        cat <<EOF
 #-------------------------------------------------------------
 # ${SCRIPT_NAME} により自動生成
 #-------------------------------------------------------------
-# リモートステートから取得可能な output キーの一覧
+# リモートステートから取得可能な output キーの一覧 (データソース別)
 output "remote_state_output_keys" {
-  description = "リモートステートに定義されている output キー一覧"
-  value       = keys(data.terraform_remote_state.${DATA_SOURCE_NAME}.outputs)
+  description = "各リモートステートに定義されている output キー一覧"
+  value = {
+EOF
+        for name in "${DS_NAMES[@]}"; do
+            printf '    "%s" = keys(data.terraform_remote_state.%s.outputs)\n' "${name}" "${name}"
+        done
+        cat <<EOF
+  }
 }
 EOF
+    } >"${outputs_tf}"
 
     if [[ "${mode}" == "value" ]]; then
         cat >>"${outputs_tf}" <<EOF
 
 # 指定された output キーの値
 output "selected_output_value" {
-  description = "リモートステートの output '${OUTPUT_KEY}' の値"
-  value       = data.terraform_remote_state.${DATA_SOURCE_NAME}.outputs["${OUTPUT_KEY}"]
+  description = "データソース '${SELECTED_DS}' の output '${OUTPUT_KEY}' の値"
+  value       = data.terraform_remote_state.${SELECTED_DS}.outputs["${OUTPUT_KEY}"]
 }
 EOF
     fi
@@ -571,16 +824,42 @@ EOF
 # リモートステート操作
 #===============================================================================
 
+#--- plan 検証つき apply (読み取り専用の担保) -----------------------------------
+# plan を保存し、リソースの作成・変更・削除が含まれないことを確認してから
+# その plan ファイルのみを apply する。データソースの読み取り (read/no-op) と
+# output の更新のみを許可する。
+run_terraform_apply_safely() {
+    local planfile="${WORKDIR}/tfplan"
+
+    log_info "terraform plan でリソース変更が無いことを確認しています ..."
+    run_terraform plan -no-color -out="${planfile}"
+
+    local changes
+    changes="$(terraform -chdir="${WORKDIR}" show -json "${planfile}" 2>"${WORKDIR}/show_err.log" \
+        | jq '[(.resource_changes // [])[] | select((.change.actions - ["no-op", "read"]) | length > 0)] | length' 2>/dev/null || true)"
+    if [[ -z "${changes}" || ! "${changes}" =~ ^[0-9]+$ ]]; then
+        die "${EXIT_GENERIC_ERROR}" \
+            "plan 結果 (terraform show -json) の解析に失敗しました。--debug と --keep-workdir を指定して再実行し、内容を確認してください。"
+    fi
+    if [[ "${changes}" -ne 0 ]]; then
+        die "${EXIT_GENERIC_ERROR}" \
+            "plan にリソースの作成・変更・削除が ${changes} 件含まれています。本スクリプトはリモートステートの読み取り専用のため処理を中止します。指定した Terraform 定義の内容を確認してください。"
+    fi
+    log_info "リソース変更が無いことを確認しました (作成/変更/削除: 0件)。"
+
+    log_info "terraform apply (検証済み plan) でリモートステートを読み取っています ..."
+    run_terraform apply -no-color "${planfile}"
+}
+
 #--- init + apply でリモートステートを実読み取りする ----------------------------
 terraform_init_and_read() {
     log_info "terraform init を実行しています ..."
     run_terraform init -no-color
 
-    log_info "terraform apply でリモートステートを読み取っています ..."
-    run_terraform apply -auto-approve -no-color
+    run_terraform_apply_safely
 }
 
-#--- output キー一覧を取得する (JSON配列で返す) ---------------------------------
+#--- output キー一覧を取得する ({データソース名: [キー一覧]} の JSONオブジェクト) --
 get_output_keys_json() {
     local json
     if ! json="$(terraform -chdir="${WORKDIR}" output -json remote_state_output_keys 2>"${WORKDIR}/output_err.log")"; then
@@ -588,7 +867,7 @@ get_output_keys_json() {
         tail -n 10 "${WORKDIR}/output_err.log" >&2
         exit "${EXIT_TERRAFORM_ERROR}"
     fi
-    if ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"${json}"; then
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${json}"; then
         die "${EXIT_GENERIC_ERROR}" "output キー一覧の JSON 解析に失敗しました (jq)。--debug で詳細を確認してください。"
     fi
     printf '%s' "${json}"
@@ -596,10 +875,13 @@ get_output_keys_json() {
 
 #--- 選択キーの値を取得して表示する ---------------------------------------------
 fetch_and_show_value() {
+    # 対象データソースが未確定の場合 (単一データソース構成) は先頭を使用する
+    [[ -z "${SELECTED_DS}" ]] && SELECTED_DS="${DS_NAMES[0]}"
+
     generate_outputs_tf "value"
 
-    log_info "output キー '${OUTPUT_KEY}' の値を取得しています ..."
-    run_terraform apply -auto-approve -no-color
+    log_info "データソース '${SELECTED_DS}' の output キー '${OUTPUT_KEY}' の値を取得しています ..."
+    run_terraform_apply_safely
 
     local value_json
     if ! value_json="$(terraform -chdir="${WORKDIR}" output -json selected_output_value 2>"${WORKDIR}/output_err.log")"; then
@@ -612,7 +894,10 @@ fetch_and_show_value() {
     echo "=================================================================="
     echo " リモートステート output 取得結果"
     echo "=================================================================="
-    echo "  データソース : data.terraform_remote_state.${DATA_SOURCE_NAME}"
+    echo "  データソース : data.terraform_remote_state.${SELECTED_DS}"
+    if [[ -n "${DS_S3KEYS[${SELECTED_DS}]:-}" ]]; then
+        echo "  ステートキー : s3://${BUCKET}/${DS_S3KEYS[${SELECTED_DS}]}"
+    fi
     echo "  output キー  : ${OUTPUT_KEY}"
     echo "  取得値 (JSON):"
     jq . <<<"${value_json}" | sed 's/^/    /'
@@ -620,13 +905,15 @@ fetch_and_show_value() {
 }
 
 #--- 検索・番号選択 --------------------------------------------------------------
+# 引数: [{ds: データソース名, key: outputキー}, ...] の JSON配列
+# 選択結果を SELECTED_DS / OUTPUT_KEY に設定する。
 select_key_interactive() {
-    local keys_json="$1"
+    local pairs_json="$1"
     local candidates_json
 
-    # 大文字小文字を無視した部分一致でフィルタ
+    # 大文字小文字を無視した部分一致でフィルタ (output キー名が対象)
     candidates_json="$(jq --arg s "${SEARCH_STRING}" \
-        '[.[] | select(ascii_downcase | contains($s | ascii_downcase))]' <<<"${keys_json}")"
+        '[.[] | select(.key | ascii_downcase | contains($s | ascii_downcase))]' <<<"${pairs_json}")"
 
     local count
     count="$(jq 'length' <<<"${candidates_json}")"
@@ -634,8 +921,8 @@ select_key_interactive() {
     if [[ "${count}" -eq 0 ]]; then
         log_warn "検索文字列 '${SEARCH_STRING}' に一致する output キーは見つかりませんでした。"
         echo ""
-        echo "取得可能な output キー一覧:"
-        jq -r '.[] | "  - " + .' <<<"${keys_json}"
+        echo "取得可能な output キー一覧 (データソース : キー):"
+        jq -r '.[] | "  - " + .ds + " : " + .key' <<<"${pairs_json}"
         exit "${EXIT_GENERIC_ERROR}"
     fi
 
@@ -643,10 +930,11 @@ select_key_interactive() {
     echo "検索文字列 '${SEARCH_STRING}' に一致する output キー候補 (${count}件):"
     echo "------------------------------------------------------------------"
     local i=1
-    while IFS= read -r key; do
-        printf '  [%d] %s\n' "${i}" "${key}"
+    local line
+    while IFS= read -r line; do
+        printf '  [%d] %s\n' "${i}" "${line}"
         i=$((i + 1))
-    done < <(jq -r '.[]' <<<"${candidates_json}")
+    done < <(jq -r '.[] | .key + "  (データソース: " + .ds + ")"' <<<"${candidates_json}")
     echo "------------------------------------------------------------------"
 
     if [[ ! -t 0 && ! -r /dev/tty ]]; then
@@ -672,8 +960,9 @@ select_key_interactive() {
         echo "  不正な入力です。1 から ${count} の番号、または q を入力してください。"
     done
 
-    OUTPUT_KEY="$(jq -r --argjson i "$((choice - 1))" '.[$i]' <<<"${candidates_json}")"
-    log_info "選択されたキー: ${OUTPUT_KEY}"
+    SELECTED_DS="$(jq -r --argjson i "$((choice - 1))" '.[$i].ds' <<<"${candidates_json}")"
+    OUTPUT_KEY="$(jq -r --argjson i "$((choice - 1))" '.[$i].key' <<<"${candidates_json}")"
+    log_info "選択されたキー: ${OUTPUT_KEY} (データソース: ${SELECTED_DS})"
 }
 
 #===============================================================================
@@ -709,7 +998,7 @@ main() {
     # AWS 操作権限確認 + スイッチバック制御
     # モードA (.tf ファイル指定) で bucket/key が不明な場合、S3 個別チェックは
     # スキップし、Terraform 実行時のエラー切り分けに委ねる。
-    if [[ -n "${BUCKET}" && -n "${STATE_KEY}" && -n "${REGION}" ]] || [[ -n "${ROLE_ARN}" ]]; then
+    if [[ -n "${BUCKET}" && -n "${REGION}" ]] || [[ -n "${ROLE_ARN}" ]]; then
         if ! check_aws_permission; then
             if [[ "${AUTO_SWITCHBACK}" == "true" ]]; then
                 log_warn "権限不足を検知しました。自動スイッチバックを実行します。"
@@ -720,7 +1009,7 @@ main() {
             fi
         fi
     else
-        log_info "bucket/state-key/region が未指定のため、S3 事前権限チェックはスキップします (Terraform 実行時に検証されます)。"
+        log_info "bucket/region が未指定のため、S3 事前権限チェックはスキップします (Terraform 実行時に検証されます)。"
     fi
 
     # 一時作業ディレクトリの作成とクリーンアップ登録
@@ -730,51 +1019,85 @@ main() {
 
     # Terraform コード生成
     if [[ -n "${TF_DATA_SOURCE_FILE}" ]]; then
+        check_tf_file_safety
         extract_data_source_name
     fi
     generate_main_tf
+    generate_backend_override_tf
     generate_outputs_tf "keys"
 
     # リモートステートの実読み取り (init + apply)
     terraform_init_and_read
     log_info "terraform_remote_state データソースの読み取りに成功しました。"
 
-    # output キー一覧の取得
-    local keys_json key_count
+    # output キー一覧の取得 ({データソース名: [キー一覧]} 形式)
+    local keys_json pairs_json pair_count
     keys_json="$(get_output_keys_json)"
-    key_count="$(jq 'length' <<<"${keys_json}")"
+    # (データソース名, output キー) の組に展開する
+    pairs_json="$(jq '[to_entries[] | .key as $ds | .value[] | {ds: $ds, key: .}]' <<<"${keys_json}")"
+    pair_count="$(jq 'length' <<<"${pairs_json}")"
 
-    if [[ "${key_count}" -eq 0 ]]; then
-        log_warn "リモートステートに output が1件も定義されていません。データソース自体の読み取りは成功しています。"
+    if [[ "${pair_count}" -eq 0 ]]; then
+        log_warn "対象リモートステートに output が1件も定義されていません。データソース自体の読み取りは成功しています。"
         exit "${EXIT_OK}"
     fi
 
     # モード分岐
     if [[ -n "${SEARCH_STRING}" ]]; then
         # 検索・選択モード
-        select_key_interactive "${keys_json}"
+        select_key_interactive "${pairs_json}"
         fetch_and_show_value
     elif [[ -n "${OUTPUT_KEY}" ]]; then
         # 直接指定モード: キーの存在を確認してから取得
-        if ! jq -e --arg k "${OUTPUT_KEY}" 'index($k) != null' >/dev/null <<<"${keys_json}"; then
-            log_error "指定された output キー '${OUTPUT_KEY}' はリモートステートに存在しません。"
+        local matches_json match_count
+        matches_json="$(jq --arg k "${OUTPUT_KEY}" '[.[] | select(.key == $k)]' <<<"${pairs_json}")"
+        if [[ "${DATA_SOURCE_NAME_SET}" == "true" ]]; then
+            # --data-source-name 指定時は対象データソースを絞り込む
+            matches_json="$(jq --arg d "${DATA_SOURCE_NAME}" '[.[] | select(.ds == $d)]' <<<"${matches_json}")"
+        fi
+        match_count="$(jq 'length' <<<"${matches_json}")"
+
+        if [[ "${match_count}" -eq 0 ]]; then
+            log_error "指定された output キー '${OUTPUT_KEY}' は対象リモートステートに存在しません。"
             echo "" >&2
-            echo "取得可能な output キー一覧:" >&2
-            jq -r '.[] | "  - " + .' <<<"${keys_json}" >&2
+            echo "取得可能な output キー一覧 (データソース : キー):" >&2
+            jq -r '.[] | "  - " + .ds + " : " + .key' <<<"${pairs_json}" >&2
             exit "${EXIT_GENERIC_ERROR}"
         fi
+        if [[ "${match_count}" -gt 1 ]]; then
+            log_error "output キー '${OUTPUT_KEY}' が複数のデータソースに存在します (${match_count}件)。--data-source-name で対象を指定してください。"
+            echo "" >&2
+            echo "該当するデータソース:" >&2
+            jq -r '.[] | "  - " + .ds' <<<"${matches_json}" >&2
+            exit "${EXIT_PARAM_ERROR}"
+        fi
+        SELECTED_DS="$(jq -r '.[0].ds' <<<"${matches_json}")"
         fetch_and_show_value
     else
-        # 検証のみモード: キー一覧を表示
+        # 検証のみモード: データソースごとにキー一覧を表示
         echo ""
         echo "=================================================================="
         echo " terraform_remote_state データソース検証結果: 成功"
         echo "=================================================================="
-        echo "  データソース : data.terraform_remote_state.${DATA_SOURCE_NAME}"
-        echo "  取得可能な output キー (${key_count}件):"
-        jq -r '.[] | "    - " + .' <<<"${keys_json}"
+        echo "  データソース: ${#DS_NAMES[@]} 件 / output キー合計: ${pair_count} 件"
+        local name ds_keys
+        for name in "${DS_NAMES[@]}"; do
+            echo ""
+            if [[ -n "${DS_S3KEYS[${name}]:-}" ]]; then
+                echo "  ■ data.terraform_remote_state.${name}  (key: ${DS_S3KEYS[${name}]})"
+            else
+                echo "  ■ data.terraform_remote_state.${name}"
+            fi
+            ds_keys="$(jq -r --arg ds "${name}" '(.[$ds] // [])[] | "      - " + .' <<<"${keys_json}")"
+            if [[ -n "${ds_keys}" ]]; then
+                printf '%s\n' "${ds_keys}"
+            else
+                echo "      (output なし)"
+            fi
+        done
         echo "=================================================================="
         echo "  値を取得するには --output-key <キー名> または --search <文字列> を指定してください。"
+        echo "  同名キーが複数データソースにある場合は --data-source-name で対象を指定できます。"
     fi
 
     log_info "処理が正常に完了しました。"
