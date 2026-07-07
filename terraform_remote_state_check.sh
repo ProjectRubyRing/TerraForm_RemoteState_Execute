@@ -407,8 +407,10 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
                                csv  : Excel 取り込み向け CSV (.csv, UTF-8 BOM+CRLF)
                                both : text と csv の両方を出力
   --excel                    --report-format csv の別名 (Excel 取り込み向け CSV)
-  --json-expand              output の取得値が JSON 構造 (オブジェクト/配列) の
-                             場合に、JSON のキーと値へ深掘りして表示・出力する
+  --json-expand              output 値が JSON 構造 (オブジェクト/配列) の場合に、
+                             JSON のキーと値へ深掘りして表示・出力する。
+                             値取得時だけでなく、キー一覧表示時も各キーの値を
+                             取得して深掘り表示する (値は一時ローカルステートのみ)。
   --debug                    生成コード・実行コマンド・terraform 出力を表示する
   --keep-workdir             終了時に一時作業ディレクトリを削除しない
   --help                     このヘルプを表示する
@@ -820,6 +822,8 @@ EOF
 # mode=keys : キー一覧のみを output (値を state/ログに出さないため keys() を使用)
 #             複数データソース対応のため { データソース名 = [キー一覧] } のマップで出力する。
 # mode=value: キー一覧 + 選択データソース (SELECTED_DS) の選択キーの値を output
+# --json-expand 指定時は、いずれのモードでも全 output 値 (remote_state_all_outputs) を
+# 追加し、キー一覧の JSON 深掘り表示に利用する。
 generate_outputs_tf() {
     local mode="$1"
     local outputs_tf="${WORKDIR}/outputs.tf"
@@ -843,6 +847,27 @@ EOF
 }
 EOF
     } >"${outputs_tf}"
+
+    # --json-expand 指定時は全 output 値も取得できるようにする (キー一覧の深掘り表示用)。
+    # 値は一時作業ディレクトリ内のローカルステートにのみ書き込まれ、終了時に削除される。
+    if [[ "${JSON_EXPAND}" == "true" ]]; then
+        {
+            cat <<EOF
+
+# 各リモートステートの全 output 値 (JSON 深掘り表示用)
+output "remote_state_all_outputs" {
+  description = "各リモートステートの全 output 値"
+  value = {
+EOF
+            for name in "${DS_NAMES[@]}"; do
+                printf '    "%s" = data.terraform_remote_state.%s.outputs\n' "${name}" "${name}"
+            done
+            cat <<EOF
+  }
+}
+EOF
+        } >>"${outputs_tf}"
+    fi
 
     if [[ "${mode}" == "value" ]]; then
         cat >>"${outputs_tf}" <<EOF
@@ -911,6 +936,21 @@ get_output_keys_json() {
     fi
     if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${json}"; then
         die "${EXIT_GENERIC_ERROR}" "output キー一覧の JSON 解析に失敗しました (jq)。--debug で詳細を確認してください。"
+    fi
+    printf '%s' "${json}"
+}
+
+#--- 全 output 値を取得する ({データソース名: {キー: 値}} の JSONオブジェクト) ----
+# --json-expand 指定時のみ outputs.tf に remote_state_all_outputs が生成される。
+get_all_outputs_json() {
+    local json
+    if ! json="$(terraform -chdir="${WORKDIR}" output -json remote_state_all_outputs 2>"${WORKDIR}/output_err.log")"; then
+        log_error "全 output 値の取得に失敗しました。"
+        tail -n 10 "${WORKDIR}/output_err.log" >&2
+        exit "${EXIT_TERRAFORM_ERROR}"
+    fi
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"${json}"; then
+        die "${EXIT_GENERIC_ERROR}" "全 output 値の JSON 解析に失敗しました (jq)。--debug で詳細を確認してください。"
     fi
     printf '%s' "${json}"
 }
@@ -1070,6 +1110,25 @@ render_json_expand() {
     ' <<<"${json}"
 }
 
+#--- キー一覧を値付き (JSON 深掘り) で1データソース分レンダリングする ----------
+# $1: all_outputs_json ({ds: {key: value}}) / $2: ds名 / $3: keys_json / $4: 行頭インデント
+# スカラー値は "- key = 値"、JSON 構造は "- key:" + キーパス深掘り行で表示する。
+render_ds_keys_expanded() {
+    local all="$1" ds="$2" keys_json="$3" indent="$4"
+    local key val
+    while IFS= read -r key; do
+        [[ -z "${key}" ]] && continue
+        val="$(jq -c --arg d "${ds}" --arg k "${key}" '.[$d][$k]' <<<"${all}")"
+        if jq -e 'type == "object" or type == "array"' >/dev/null 2>&1 <<<"${val}" \
+           && [[ -n "$(render_json_expand "${val}")" ]]; then
+            printf '%s- %s:\n' "${indent}" "${key}"
+            render_json_expand "${val}" | sed "s/^/${indent}    /"
+        else
+            printf '%s- %s = %s\n' "${indent}" "${key}" "$(jq -r 'tojson' <<<"${val}")"
+        fi
+    done < <(jq -r --arg ds "${ds}" '(.[$ds] // [])[]' <<<"${keys_json}")
+}
+
 #--- output 値の取得結果をファイル出力する ------------------------------------
 # $1: 取得値 (JSON文字列)。--output-dir 未指定なら何もしない。
 write_value_report() {
@@ -1143,10 +1202,18 @@ write_value_report() {
 
 #--- output キー一覧をファイル出力する ----------------------------------------
 # $1: keys_json ({データソース名: [キー一覧]}) / $2: pairs_json ([{ds,key},...])
+# $3: all_outputs_json ({ds: {key: value}})。--json-expand 指定時のみ渡され、値を深掘り出力する。
 write_keys_report() {
     local keys_json="$1"
     local pairs_json="$2"
+    local all_outputs="${3:-}"
     [[ -z "${OUTPUT_DIR}" ]] && return 0
+
+    # --json-expand 指定かつ全 output 値が取得できている場合のみ値を深掘り出力する
+    local expand="false"
+    if [[ "${JSON_EXPAND}" == "true" && -n "${all_outputs}" ]]; then
+        expand="true"
+    fi
 
     local base="keys_${RUN_TS}"
     local pair_count
@@ -1169,7 +1236,8 @@ write_keys_report() {
             [[ -n "${BUCKET}" ]] && printf ' バケット      : s3://%s\n' "${BUCKET}"
             [[ -n "${REGION}" ]] && printf ' リージョン    : %s\n' "${REGION}"
             printf ' データソース  : %d 件 / output キー合計: %d 件\n' "${#DS_NAMES[@]}" "${pair_count}"
-            local ds_keys
+            [[ "${expand}" == "true" ]] && printf ' (--json-expand: 値を JSON 深掘り表示)\n'
+            local ds_keys ds_key_count
             for name in "${DS_NAMES[@]}"; do
                 printf '\n'
                 if [[ -n "${DS_S3KEYS[${name}]:-}" ]]; then
@@ -1177,11 +1245,14 @@ write_keys_report() {
                 else
                     printf '  ■ data.terraform_remote_state.%s\n' "${name}"
                 fi
-                ds_keys="$(jq -r --arg ds "${name}" '(.[$ds] // [])[] | "      - " + .' <<<"${keys_json}")"
-                if [[ -n "${ds_keys}" ]]; then
-                    printf '%s\n' "${ds_keys}"
-                else
+                ds_key_count="$(jq -r --arg ds "${name}" '(.[$ds] // []) | length' <<<"${keys_json}")"
+                if [[ "${ds_key_count}" -eq 0 ]]; then
                     printf '      (output なし)\n'
+                elif [[ "${expand}" == "true" ]]; then
+                    render_ds_keys_expanded "${all_outputs}" "${name}" "${keys_json}" "      "
+                else
+                    ds_keys="$(jq -r --arg ds "${name}" '(.[$ds] // [])[] | "      - " + .' <<<"${keys_json}")"
+                    printf '%s\n' "${ds_keys}"
                 fi
             done
             printf '==================================================================\n'
@@ -1192,10 +1263,36 @@ write_keys_report() {
     # CSV 形式 (Excel 取り込み向け)
     if [[ "${REPORT_FORMAT}" == "csv" || "${REPORT_FORMAT}" == "both" ]]; then
         local f="${OUTPUT_DIR}/${base}.csv"
-        {
-            printf 'data_source,s3_key,output_key\n'
-            jq -r --argjson s3 "${s3map}" '.[] | [.ds, ($s3[.ds] // ""), .key] | @csv' <<<"${pairs_json}"
-        } | write_csv_file "${f}"
+        if [[ "${expand}" == "true" ]]; then
+            # 値を JSON 深掘りして (ds, s3_key, output_key, json_path, value) 単位で出力する
+            {
+                printf 'data_source,s3_key,output_key,json_path,value\n'
+                jq -r --argjson s3 "${s3map}" --argjson all "${all_outputs}" '
+                    def fmtpath:
+                        reduce .[] as $k ("";
+                            . + (if ($k|type) == "number" then "[\($k)]"
+                                 else (if . == "" then $k else "." + $k end) end));
+                    .[]
+                    | .ds as $ds | .key as $ok | ($s3[$ds] // "") as $sk | ($all[$ds][$ok]) as $v
+                    | if ($v|type) == "object" or ($v|type) == "array"
+                      then ([$v | paths(scalars)]) as $ps
+                           | if ($ps | length) == 0
+                             then [$ds, $sk, $ok, "", ($v | tojson)]
+                             else $ps[] as $p
+                                  | [$ds, $sk, $ok, ($p | fmtpath),
+                                     ($v | getpath($p) | if type == "object" or type == "array" then tojson else . end)]
+                             end
+                      else [$ds, $sk, $ok, "", $v]
+                      end
+                    | @csv
+                ' <<<"${pairs_json}"
+            } | write_csv_file "${f}"
+        else
+            {
+                printf 'data_source,s3_key,output_key\n'
+                jq -r --argjson s3 "${s3map}" '.[] | [.ds, ($s3[.ds] // ""), .key] | @csv' <<<"${pairs_json}"
+            } | write_csv_file "${f}"
+        fi
     fi
 }
 
@@ -1312,12 +1409,20 @@ main() {
         fetch_and_show_value
     else
         # 検証のみモード: データソースごとにキー一覧を表示
+        # --json-expand 指定時は全 output 値を取得し、キーごとに値を深掘り表示する
+        local all_outputs="" expand_keys="false"
+        if [[ "${JSON_EXPAND}" == "true" ]]; then
+            all_outputs="$(get_all_outputs_json)"
+            expand_keys="true"
+        fi
+
         echo ""
         echo "=================================================================="
         echo " terraform_remote_state データソース検証結果: 成功"
         echo "=================================================================="
         echo "  データソース: ${#DS_NAMES[@]} 件 / output キー合計: ${pair_count} 件"
-        local name ds_keys
+        [[ "${expand_keys}" == "true" ]] && echo "  (--json-expand: 各キーの値を JSON 深掘り表示)"
+        local name ds_keys ds_key_count
         for name in "${DS_NAMES[@]}"; do
             echo ""
             if [[ -n "${DS_S3KEYS[${name}]:-}" ]]; then
@@ -1325,11 +1430,14 @@ main() {
             else
                 echo "  ■ data.terraform_remote_state.${name}"
             fi
-            ds_keys="$(jq -r --arg ds "${name}" '(.[$ds] // [])[] | "      - " + .' <<<"${keys_json}")"
-            if [[ -n "${ds_keys}" ]]; then
-                printf '%s\n' "${ds_keys}"
-            else
+            ds_key_count="$(jq -r --arg ds "${name}" '(.[$ds] // []) | length' <<<"${keys_json}")"
+            if [[ "${ds_key_count}" -eq 0 ]]; then
                 echo "      (output なし)"
+            elif [[ "${expand_keys}" == "true" ]]; then
+                render_ds_keys_expanded "${all_outputs}" "${name}" "${keys_json}" "      "
+            else
+                ds_keys="$(jq -r --arg ds "${name}" '(.[$ds] // [])[] | "      - " + .' <<<"${keys_json}")"
+                printf '%s\n' "${ds_keys}"
             fi
         done
         echo "=================================================================="
@@ -1337,7 +1445,7 @@ main() {
         echo "  同名キーが複数データソースにある場合は --data-source-name で対象を指定できます。"
 
         # ファイル出力 (--output-dir 指定時)
-        write_keys_report "${keys_json}" "${pairs_json}"
+        write_keys_report "${keys_json}" "${pairs_json}" "${all_outputs}"
     fi
 
     log_info "処理が正常に完了しました。"

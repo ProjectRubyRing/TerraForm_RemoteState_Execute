@@ -107,7 +107,7 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 | `--output-dir <dir>` | 結果をレポートファイルとして出力するディレクトリ(存在しない場合は自動作成)。キー一覧・値取得のいずれの結果も内容に応じたレポート形式で出力します。 |
 | `--report-format <fmt>` | `--output-dir` 指定時のファイル形式(既定: `text`)。`text`(整形レポート .txt)/ `csv`(Excel 取り込み向け .csv)/ `both`(両方)。 |
 | `--excel` | `--report-format csv` の別名(Excel 取り込み向け CSV を出力) |
-| `--json-expand` | output の取得値が JSON 構造(オブジェクト/配列)の場合に、JSON のキーと値へ深掘りして表示・出力する |
+| `--json-expand` | output 値が JSON 構造(オブジェクト/配列)の場合に、JSON のキーと値へ深掘りして表示・出力する。値取得時だけでなく、**キー一覧表示時も各キーの値を取得して深掘り表示**します(値は一時ローカルステートのみに書き込まれ終了時に削除)。 |
 | `--debug` | 生成コード・実行コマンド・terraform 出力を表示する |
 | `--keep-workdir` | 終了時に一時作業ディレクトリを削除しない |
 | `--help` | ヘルプを表示する |
@@ -206,6 +206,25 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 
 CSV 形式かつ `--json-expand` 指定時は、深掘りしたキーパス単位で 1 行ずつ(`data_source, s3_key, output_key, json_path, value` 列)出力されるため、Excel 上でキーパスごとに値を扱えます。
 
+`--json-expand` は**キー一覧表示時**にも適用されます。`--output-key` / `--search` を指定しない一覧モードでは、通常はキー名のみを表示しますが、`--json-expand` を付けると各キーの値も取得し、スカラー値は `- キー = 値`、JSON 構造は `- キー:` の下にキーパスを深掘りして表示します(CSV も同様にキーパス単位で展開)。値は一時作業ディレクトリ内のローカルステートにのみ書き込まれ、終了時に削除されます。
+
+```
+  ■ data.terraform_remote_state.INFRA_network_prod  (key: network/prod/terraform.tfstate)
+      - vpc_id = "vpc-123"
+      - vpc_config:
+          cidr = "10.0.0.0/16"
+          tags.env = "prod"
+      - subnet_ids:
+          [0] = "subnet-a"
+          [1] = "subnet-b"
+```
+
+```bash
+# キー一覧を各キーの値ごと深掘り表示し、CSV でも出力
+./terraform_remote_state_check.sh --bucket team-a-tfstate --region ap-northeast-1 \
+    --json-expand --output-dir ./reports --report-format both
+```
+
 ```bash
 # 値を Excel 取り込み向け CSV で出力しつつ、JSON はキーパス単位に展開
 ./terraform_remote_state_check.sh --bucket team-a-tfstate --state-key network/terraform.tfstate \
@@ -253,4 +272,4 @@ CSV 形式かつ `--json-expand` 指定時は、深掘りしたキーパス単�
 | 1.0.0 | 初版(モードA/B、検索・選択、assume role、スイッチバック対応) |
 | 1.1.0 | 読み取り専用ガードを追加(`backend_override.tf` によるローカルステート強制、`resource` / `module` ブロックを含む .tf の入力拒否、plan のリソース変更ゼロ検証後の apply) |
 | 1.2.0 | バケット全体参照モード(モードC)と命名テンプレート `--name-template`(既定: `INFRA_{dir1}_{dir2}`)を追加 |
-| 1.3.0 | 結果のファイル出力機能を追加。`--output-dir` で出力先を指定し、`--report-format`(`text` / `csv` / `both`)・`--excel` できれいなレポート形式や Excel 取り込み向け CSV(UTF-8 BOM + CRLF)を選択可能に。`--json-expand` で JSON 構造の取得値をキーパス単位に深掘り表示・出力する機能を追加 |
+| 1.3.0 | 結果のファイル出力機能を追加。`--output-dir` で出力先を指定し、`--report-format`(`text` / `csv` / `both`)・`--excel` できれいなレポート形式や Excel 取り込み向け CSV(UTF-8 BOM + CRLF)を選択可能に。`--json-expand` で JSON 構造の取得値をキーパス単位に深掘り表示・出力する機能を追加(値取得時に加え、キー一覧表示時も各キーの値を深掘り表示) |
