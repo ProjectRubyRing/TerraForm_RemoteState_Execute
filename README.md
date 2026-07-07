@@ -3,7 +3,7 @@
 S3 バックエンドに保存された**他チーム管理の Terraform リモートステート**を、`terraform_remote_state` データソース経由で実際に読み取り、データソース定義の動作確認および output キーの検索・選択・値取得を行う検証用スクリプトです。
 
 - **対象環境**: RHEL9 (EC2), bash 5.x, Terraform 1.x, AWS CLI v2, jq
-- **バージョン**: 1.2.0
+- **バージョン**: 1.3.0
 
 ## 安全方針(読み取り専用)
 
@@ -104,6 +104,10 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 | `--auto-switchback` | 権限不足時に自動スイッチバックして継続する |
 | `--no-auto-switchback` | 権限不足時は警告して終了する(既定) |
 | `--common-sh-path <path>` | 外部 common.sh のパス(省略時は内蔵の共通関数で動作) |
+| `--output-dir <dir>` | 結果をレポートファイルとして出力するディレクトリ(存在しない場合は自動作成)。キー一覧・値取得のいずれの結果も内容に応じたレポート形式で出力します。 |
+| `--report-format <fmt>` | `--output-dir` 指定時のファイル形式(既定: `text`)。`text`(整形レポート .txt)/ `csv`(Excel 取り込み向け .csv)/ `both`(両方)。 |
+| `--excel` | `--report-format csv` の別名(Excel 取り込み向け CSV を出力) |
+| `--json-expand` | output の取得値が JSON 構造(オブジェクト/配列)の場合に、JSON のキーと値へ深掘りして表示・出力する |
 | `--debug` | 生成コード・実行コマンド・terraform 出力を表示する |
 | `--keep-workdir` | 終了時に一時作業ディレクトリを削除しない |
 | `--help` | ヘルプを表示する |
@@ -166,6 +170,53 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
     --output-key vpc_id --data-source-name INFRA_network_prod
 ```
 
+## ファイル出力(レポート機能)
+
+`--output-dir <dir>` を指定すると、画面表示に加えて結果を指定ディレクトリへレポートファイルとして出力します(ディレクトリが存在しない場合は自動作成)。出力される内容は動作モードに応じて次の 2 種類です。
+
+- **キー一覧レポート**(`--output-key` / `--search` 未指定時): データソースごとの output キー一覧
+- **値取得レポート**(`--output-key` / `--search` 指定時): 選択キーの取得値
+
+出力形式は `--report-format`(または `--excel`)で選択します。
+
+| 形式 | 拡張子 | 内容 |
+|---|---|---|
+| `text`(既定) | `.txt` | 見出し・メタ情報付きの整形されたきれいなレポート |
+| `csv` / `--excel` | `.csv` | Excel できれいに取り込める CSV。**UTF-8 BOM 付き・CRLF 改行**のため、Excel でダブルクリックするだけで文字化けせず列分割された状態で開けます。 |
+| `both` | `.txt` と `.csv` | 両方を出力 |
+
+ファイル名は実行時刻付きで、キー一覧は `keys_<日時>.(txt|csv)`、値取得は `value_<データソース名>_<キー名>_<日時>.(txt|csv)` の形式になります。
+
+### JSON 値の深掘り表示(`--json-expand`)
+
+取得した output 値が JSON 構造(オブジェクト/配列)の場合、`--json-expand` を指定すると値をそのまま表示するだけでなく、**JSON のキーと値へ深掘り**して「キーパス = 値」の形式で展開表示・出力します。ネストしたオブジェクトはドット区切り、配列はインデックス `[n]` で表現されます。
+
+```
+ 取得値 (JSON):
+   {
+     "vpc": { "id": "vpc-123" },
+     "subnets": [ "subnet-a", "subnet-b" ]
+   }
+
+ JSON 深掘り (キーパス = 値):
+   vpc.id = "vpc-123"
+   subnets[0] = "subnet-a"
+   subnets[1] = "subnet-b"
+```
+
+CSV 形式かつ `--json-expand` 指定時は、深掘りしたキーパス単位で 1 行ずつ(`data_source, s3_key, output_key, json_path, value` 列)出力されるため、Excel 上でキーパスごとに値を扱えます。
+
+```bash
+# 値を Excel 取り込み向け CSV で出力しつつ、JSON はキーパス単位に展開
+./terraform_remote_state_check.sh --bucket team-a-tfstate --state-key network/terraform.tfstate \
+    --region ap-northeast-1 --output-key vpc_config \
+    --output-dir ./reports --excel --json-expand
+
+# キー一覧を text と csv の両方でレポート出力
+./terraform_remote_state_check.sh --bucket team-a-tfstate --region ap-northeast-1 \
+    --output-dir ./reports --report-format both
+```
+
 ## 処理の流れ
 
 1. パラメータ解析・整合性チェック
@@ -174,7 +225,7 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 4. AWS 操作権限確認(S3 head-object / list-objects-v2 / assume-role)。権限不足時は `--auto-switchback` 指定があればスイッチバック用シェルを `source` して再確認
 5. 一時作業ディレクトリに Terraform コードを生成(`main.tf` / `backend_override.tf` / `outputs.tf`)
 6. `terraform init` → `terraform plan`(リソース変更ゼロを検証)→ 検証済み plan の `apply` でリモートステートを実読み取り
-7. output キー一覧の表示、または指定・選択されたキーの値を取得して表示
+7. output キー一覧の表示、または指定・選択されたキーの値を取得して表示(`--json-expand` 指定時は JSON 値をキーパス単位に深掘り)。`--output-dir` 指定時は結果をレポートファイル(text / csv)として出力
 8. 一時作業ディレクトリを削除して終了
 
 ## 終了コード
@@ -202,3 +253,4 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 | 1.0.0 | 初版(モードA/B、検索・選択、assume role、スイッチバック対応) |
 | 1.1.0 | 読み取り専用ガードを追加(`backend_override.tf` によるローカルステート強制、`resource` / `module` ブロックを含む .tf の入力拒否、plan のリソース変更ゼロ検証後の apply) |
 | 1.2.0 | バケット全体参照モード(モードC)と命名テンプレート `--name-template`(既定: `INFRA_{dir1}_{dir2}`)を追加 |
+| 1.3.0 | 結果のファイル出力機能を追加。`--output-dir` で出力先を指定し、`--report-format`(`text` / `csv` / `both`)・`--excel` できれいなレポート形式や Excel 取り込み向け CSV(UTF-8 BOM + CRLF)を選択可能に。`--json-expand` で JSON 構造の取得値をキーパス単位に深掘り表示・出力する機能を追加 |

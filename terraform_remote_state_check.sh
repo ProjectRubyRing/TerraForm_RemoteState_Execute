@@ -27,7 +27,7 @@ set -euo pipefail
 # 定数・グローバル変数
 #-------------------------------------------------------------------------------
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 readonly EXIT_OK=0
 readonly EXIT_PARAM_ERROR=2
 readonly EXIT_AUTH_ERROR=3
@@ -53,9 +53,13 @@ COMMON_SH_PATH=""
 NAME_TEMPLATE="INFRA_{dir1}_{dir2}"
 DEBUG="false"
 KEEP_WORKDIR="false"
+OUTPUT_DIR=""                # 結果レポートの出力先ディレクトリ (指定時にファイル出力)
+REPORT_FORMAT="text"         # ファイル出力形式: text | csv | both
+JSON_EXPAND="false"          # output 値が JSON 構造の場合にキー・値へ深掘り表示する
 
 # 内部状態
 WORKDIR=""
+RUN_TS=""                   # 実行時タイムスタンプ (出力ファイル名用)
 TF_VERSION=""
 SWITCHBACK_EXECUTED="false"
 ALL_STATES="false"          # --state-key 省略時: バケット内全ファイルを対象にする
@@ -395,6 +399,16 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   --auto-switchback          権限不足時に自動スイッチバックして継続する
   --no-auto-switchback       権限不足時は警告して終了する (既定)
   --common-sh-path <path>    外部 common.sh のパス (省略時は内蔵の共通関数で動作)
+  --output-dir <dir>         結果をレポートファイルとして出力するディレクトリ
+                             (存在しない場合は自動作成)。キー一覧・値取得の
+                             いずれの結果も内容に応じたレポート形式で出力します。
+  --report-format <fmt>      --output-dir 指定時のファイル形式 (既定: text)
+                               text : きれいな整形レポート (.txt)
+                               csv  : Excel 取り込み向け CSV (.csv, UTF-8 BOM+CRLF)
+                               both : text と csv の両方を出力
+  --excel                    --report-format csv の別名 (Excel 取り込み向け CSV)
+  --json-expand              output の取得値が JSON 構造 (オブジェクト/配列) の
+                             場合に、JSON のキーと値へ深掘りして表示・出力する
   --debug                    生成コード・実行コマンド・terraform 出力を表示する
   --keep-workdir             終了時に一時作業ディレクトリを削除しない
   --help                     このヘルプを表示する
@@ -425,6 +439,15 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
       --external-id my-external-id \\
       --auto-switchback --switchback-shell-path /opt/tools/switchback_aws.sh
 
+  # 7) 値を取得し、Excel 取り込み向け CSV としてファイル出力 (JSON は深掘り)
+  ${SCRIPT_NAME} --bucket team-a-tfstate --state-key network/terraform.tfstate \\
+      --region ap-northeast-1 --output-key vpc_config \\
+      --output-dir ./reports --excel --json-expand
+
+  # 8) キー一覧を text と csv の両方でレポート出力
+  ${SCRIPT_NAME} --bucket team-a-tfstate --region ap-northeast-1 \\
+      --output-dir ./reports --report-format both
+
 終了コード:
   0: 正常終了  2: パラメータ不正  3: AWS認証エラー  4: 権限不足
   5: スイッチバック失敗  6: Terraform実行失敗  1: その他のエラー
@@ -452,6 +475,10 @@ parse_args() {
             --auto-switchback)             AUTO_SWITCHBACK="true"; shift ;;
             --no-auto-switchback)          AUTO_SWITCHBACK="false"; shift ;;
             --common-sh-path)              COMMON_SH_PATH="${2:?--common-sh-path に値が必要です}"; shift 2 ;;
+            --output-dir)                  OUTPUT_DIR="${2:?--output-dir に値が必要です}"; shift 2 ;;
+            --report-format)               REPORT_FORMAT="${2:?--report-format に値が必要です}"; shift 2 ;;
+            --excel)                       REPORT_FORMAT="csv"; shift ;;
+            --json-expand)                 JSON_EXPAND="true"; shift ;;
             --debug)                       DEBUG="true"; shift ;;
             --keep-workdir)                KEEP_WORKDIR="true"; shift ;;
             --help|-h)                     usage; exit "${EXIT_OK}" ;;
@@ -503,6 +530,21 @@ validate_args() {
     if [[ "${AUTO_SWITCHBACK}" == "true" && -z "${SWITCHBACK_SHELL_PATH}" ]]; then
         die "${EXIT_PARAM_ERROR}" \
             "--auto-switchback を指定する場合は --switchback-shell-path でスイッチバック用シェルのパスを指定してください。"
+    fi
+
+    # レポート出力形式の検証
+    case "${REPORT_FORMAT}" in
+        text|csv|both) ;;
+        *)
+            die "${EXIT_PARAM_ERROR}" \
+                "--report-format の値が不正です: '${REPORT_FORMAT}'。text / csv / both のいずれかを指定してください (--excel は csv の別名です)。"
+            ;;
+    esac
+
+    # --report-format / --excel は --output-dir とセットでのみ意味を持つ
+    if [[ -z "${OUTPUT_DIR}" && "${REPORT_FORMAT}" != "text" ]]; then
+        die "${EXIT_PARAM_ERROR}" \
+            "--report-format / --excel はファイル出力用の指定です。--output-dir で出力先ディレクトリも指定してください。"
     fi
 }
 
@@ -901,7 +943,16 @@ fetch_and_show_value() {
     echo "  output キー  : ${OUTPUT_KEY}"
     echo "  取得値 (JSON):"
     jq . <<<"${value_json}" | sed 's/^/    /'
+    # --json-expand 指定時、値が JSON 構造ならキー・値へ深掘り表示する
+    if [[ "${JSON_EXPAND}" == "true" ]] \
+       && jq -e 'type == "object" or type == "array"' >/dev/null 2>&1 <<<"${value_json}"; then
+        echo "  JSON 深掘り (キーパス = 値):"
+        render_json_expand "${value_json}" | sed 's/^/    /'
+    fi
     echo "=================================================================="
+
+    # ファイル出力 (--output-dir 指定時)
+    write_value_report "${value_json}"
 }
 
 #--- 検索・番号選択 --------------------------------------------------------------
@@ -966,6 +1017,189 @@ select_key_interactive() {
 }
 
 #===============================================================================
+# ファイル出力 (レポート) / JSON 深掘り機能
+#===============================================================================
+
+#--- 出力先ディレクトリの準備 --------------------------------------------------
+# --output-dir 指定時にディレクトリを検証・作成し、ファイル名用のタイムスタンプを確定する。
+prepare_output_dir() {
+    [[ -z "${OUTPUT_DIR}" ]] && return 0
+    if [[ ! -d "${OUTPUT_DIR}" ]]; then
+        if ! mkdir -p -- "${OUTPUT_DIR}" 2>/dev/null; then
+            die "${EXIT_PARAM_ERROR}" "出力先ディレクトリを作成できません: ${OUTPUT_DIR}"
+        fi
+        log_info "出力先ディレクトリを作成しました: ${OUTPUT_DIR}"
+    fi
+    if [[ ! -w "${OUTPUT_DIR}" ]]; then
+        die "${EXIT_PARAM_ERROR}" "出力先ディレクトリに書き込み権限がありません: ${OUTPUT_DIR}"
+    fi
+    RUN_TS="$(date '+%Y%m%d_%H%M%S')"
+    log_info "結果をファイル出力します (形式: ${REPORT_FORMAT}, 出力先: ${OUTPUT_DIR})"
+}
+
+#--- ファイル名に使える文字だけに安全化する -----------------------------------
+sanitize_filename() {
+    local s="$1"
+    s="${s//[^A-Za-z0-9._-]/_}"
+    printf '%s' "${s}"
+}
+
+#--- CSV を Excel 取り込み向けに書き出す (UTF-8 BOM + CRLF) ---------------------
+# Excel は BOM が無いと UTF-8 を誤認して文字化けするため BOM を付与し、改行は CRLF に揃える。
+# stdin: LF 区切りの CSV 本文 / $1: 出力ファイルパス
+write_csv_file() {
+    local f="$1"
+    { printf '\xEF\xBB\xBF'; sed -e 's/\r$//' -e 's/$/\r/'; } >"${f}"
+    log_info "CSV レポートを出力しました (Excel 取り込み対応): ${f}"
+}
+
+#--- JSON 値をキーパス・値へ深掘りして "パス = 値" 形式で出力する --------------
+# 例: {"vpc":{"id":"vpc-1"},"subnets":["s-1","s-2"]}
+#   -> vpc.id = "vpc-1"
+#      subnets[0] = "s-1"
+#      subnets[1] = "s-2"
+render_json_expand() {
+    local json="$1"
+    jq -r '
+        def fmtpath:
+            reduce .[] as $k ("";
+                . + (if ($k|type) == "number" then "[\($k)]"
+                     else (if . == "" then $k else "." + $k end) end));
+        paths(scalars) as $p
+        | "\($p | fmtpath) = \(getpath($p) | tojson)"
+    ' <<<"${json}"
+}
+
+#--- output 値の取得結果をファイル出力する ------------------------------------
+# $1: 取得値 (JSON文字列)。--output-dir 未指定なら何もしない。
+write_value_report() {
+    local value_json="$1"
+    [[ -z "${OUTPUT_DIR}" ]] && return 0
+
+    local is_struct="false"
+    if jq -e 'type == "object" or type == "array"' >/dev/null 2>&1 <<<"${value_json}"; then
+        is_struct="true"
+    fi
+
+    local s3key="${DS_S3KEYS[${SELECTED_DS}]:-}"
+    local base
+    base="value_$(sanitize_filename "${SELECTED_DS}")_$(sanitize_filename "${OUTPUT_KEY}")_${RUN_TS}"
+
+    # テキスト形式 (きれいなレポート)
+    if [[ "${REPORT_FORMAT}" == "text" || "${REPORT_FORMAT}" == "both" ]]; then
+        local f="${OUTPUT_DIR}/${base}.txt"
+        {
+            printf '==================================================================\n'
+            printf ' Terraform リモートステート output 取得レポート\n'
+            printf '==================================================================\n'
+            printf ' 生成日時      : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+            [[ -n "${BUCKET}" ]] && printf ' バケット      : s3://%s\n' "${BUCKET}"
+            [[ -n "${REGION}" ]] && printf ' リージョン    : %s\n' "${REGION}"
+            printf ' データソース  : data.terraform_remote_state.%s\n' "${SELECTED_DS}"
+            [[ -n "${s3key}" ]] && printf ' ステートキー  : s3://%s/%s\n' "${BUCKET}" "${s3key}"
+            printf ' output キー   : %s\n' "${OUTPUT_KEY}"
+            printf '%s\n' '------------------------------------------------------------------'
+            printf ' 取得値 (JSON):\n'
+            jq . <<<"${value_json}" | sed 's/^/   /'
+            if [[ "${is_struct}" == "true" && "${JSON_EXPAND}" == "true" ]]; then
+                printf '\n JSON 深掘り (キーパス = 値):\n'
+                render_json_expand "${value_json}" | sed 's/^/   /'
+            fi
+            printf '==================================================================\n'
+        } >"${f}"
+        log_info "テキストレポートを出力しました: ${f}"
+    fi
+
+    # CSV 形式 (Excel 取り込み向け)
+    if [[ "${REPORT_FORMAT}" == "csv" || "${REPORT_FORMAT}" == "both" ]]; then
+        local f="${OUTPUT_DIR}/${base}.csv"
+        if [[ "${is_struct}" == "true" && "${JSON_EXPAND}" == "true" ]]; then
+            # JSON をキーパス単位の行に展開して出力する
+            {
+                printf 'data_source,s3_key,output_key,json_path,value\n'
+                jq -r --arg ds "${SELECTED_DS}" --arg sk "${s3key}" --arg ok "${OUTPUT_KEY}" '
+                    def fmtpath:
+                        reduce .[] as $k ("";
+                            . + (if ($k|type) == "number" then "[\($k)]"
+                                 else (if . == "" then $k else "." + $k end) end));
+                    paths(scalars) as $p
+                    | [$ds, $sk, $ok, ($p | fmtpath),
+                       (getpath($p) | if type == "object" or type == "array" then tojson else . end)]
+                    | @csv
+                ' <<<"${value_json}"
+            } | write_csv_file "${f}"
+        else
+            {
+                printf 'data_source,s3_key,output_key,value\n'
+                jq -r --arg ds "${SELECTED_DS}" --arg sk "${s3key}" --arg ok "${OUTPUT_KEY}" '
+                    [$ds, $sk, $ok,
+                     (if type == "object" or type == "array" then tojson else . end)]
+                    | @csv
+                ' <<<"${value_json}"
+            } | write_csv_file "${f}"
+        fi
+    fi
+}
+
+#--- output キー一覧をファイル出力する ----------------------------------------
+# $1: keys_json ({データソース名: [キー一覧]}) / $2: pairs_json ([{ds,key},...])
+write_keys_report() {
+    local keys_json="$1"
+    local pairs_json="$2"
+    [[ -z "${OUTPUT_DIR}" ]] && return 0
+
+    local base="keys_${RUN_TS}"
+    local pair_count
+    pair_count="$(jq 'length' <<<"${pairs_json}")"
+
+    # データソース名 -> S3キー のマップを JSON で構築する (CSV/テキスト両用)
+    local s3map="{}" name
+    for name in "${DS_NAMES[@]}"; do
+        s3map="$(jq --arg n "${name}" --arg k "${DS_S3KEYS[${name}]:-}" '. + {($n): $k}' <<<"${s3map}")"
+    done
+
+    # テキスト形式 (きれいなレポート)
+    if [[ "${REPORT_FORMAT}" == "text" || "${REPORT_FORMAT}" == "both" ]]; then
+        local f="${OUTPUT_DIR}/${base}.txt"
+        {
+            printf '==================================================================\n'
+            printf ' Terraform リモートステート output キー一覧レポート\n'
+            printf '==================================================================\n'
+            printf ' 生成日時      : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+            [[ -n "${BUCKET}" ]] && printf ' バケット      : s3://%s\n' "${BUCKET}"
+            [[ -n "${REGION}" ]] && printf ' リージョン    : %s\n' "${REGION}"
+            printf ' データソース  : %d 件 / output キー合計: %d 件\n' "${#DS_NAMES[@]}" "${pair_count}"
+            local ds_keys
+            for name in "${DS_NAMES[@]}"; do
+                printf '\n'
+                if [[ -n "${DS_S3KEYS[${name}]:-}" ]]; then
+                    printf '  ■ data.terraform_remote_state.%s  (key: %s)\n' "${name}" "${DS_S3KEYS[${name}]}"
+                else
+                    printf '  ■ data.terraform_remote_state.%s\n' "${name}"
+                fi
+                ds_keys="$(jq -r --arg ds "${name}" '(.[$ds] // [])[] | "      - " + .' <<<"${keys_json}")"
+                if [[ -n "${ds_keys}" ]]; then
+                    printf '%s\n' "${ds_keys}"
+                else
+                    printf '      (output なし)\n'
+                fi
+            done
+            printf '==================================================================\n'
+        } >"${f}"
+        log_info "テキストレポートを出力しました: ${f}"
+    fi
+
+    # CSV 形式 (Excel 取り込み向け)
+    if [[ "${REPORT_FORMAT}" == "csv" || "${REPORT_FORMAT}" == "both" ]]; then
+        local f="${OUTPUT_DIR}/${base}.csv"
+        {
+            printf 'data_source,s3_key,output_key\n'
+            jq -r --argjson s3 "${s3map}" '.[] | [.ds, ($s3[.ds] // ""), .key] | @csv' <<<"${pairs_json}"
+        } | write_csv_file "${f}"
+    fi
+}
+
+#===============================================================================
 # メイン処理
 #===============================================================================
 main() {
@@ -983,6 +1217,9 @@ main() {
     fi
 
     validate_args
+
+    # 出力先ディレクトリの検証・準備 (指定時のみ。早期に失敗させる)
+    prepare_output_dir
 
     # 必要コマンドの存在確認
     check_command aws
@@ -1098,6 +1335,9 @@ main() {
         echo "=================================================================="
         echo "  値を取得するには --output-key <キー名> または --search <文字列> を指定してください。"
         echo "  同名キーが複数データソースにある場合は --data-source-name で対象を指定できます。"
+
+        # ファイル出力 (--output-dir 指定時)
+        write_keys_report "${keys_json}" "${pairs_json}"
     fi
 
     log_info "処理が正常に完了しました。"
