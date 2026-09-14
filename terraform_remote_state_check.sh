@@ -27,7 +27,7 @@ set -euo pipefail
 # 定数・グローバル変数
 #-------------------------------------------------------------------------------
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 readonly EXIT_OK=0
 readonly EXIT_PARAM_ERROR=2
 readonly EXIT_AUTH_ERROR=3
@@ -56,6 +56,7 @@ KEEP_WORKDIR="false"
 OUTPUT_DIR=""                # 結果レポートの出力先ディレクトリ (指定時にファイル出力)
 REPORT_FORMAT="text"         # ファイル出力形式: text | csv | both
 JSON_EXPAND="false"          # output 値が JSON 構造の場合にキー・値へ深掘り表示する
+SKIP_INVALID_STATE="true"    # ステートファイル形式に一致しないファイルはスキップして継続する
 
 # 内部状態
 WORKDIR=""
@@ -67,6 +68,16 @@ DATA_SOURCE_NAME_SET="false" # --data-source-name が明示指定されたか
 SELECTED_DS=""              # 値取得対象のデータソース名
 DS_NAMES=()                 # 生成した全データソース名 (定義順)
 declare -A DS_S3KEYS=()     # データソース名 -> S3 オブジェクトキー
+OUTPUTS_MODE="keys"         # 現在生成している outputs.tf のモード (keys|value)
+SKIPPED_KEYS=()             # ステート形式不一致等でスキップした S3 キー (検出順)
+declare -A SKIPPED_REASONS=()  # S3 キー -> スキップ理由
+SKIP_REASON=""              # ステート形式判定の結果メッセージ (内部受け渡し用)
+PRUNED_COUNT=0              # 直近の prune_data_sources で除外した件数
+
+# ステート形式の事前判定パラメータ
+readonly STATE_HEAD_BYTES=131072   # 形式判定で読み取る先頭バイト数 (128KiB)
+readonly STATE_MAX_VERSION=4       # 対応する Terraform ステートフォーマットの最大バージョン
+readonly MAX_PLAN_SKIP_RETRY=10    # plan 失敗時にデータソースを除外して再試行する最大回数
 
 # Terraform を非対話モードで実行する
 export TF_IN_AUTOMATION=1
@@ -282,10 +293,11 @@ run_switchback() {
     fi
 }
 
-#--- Terraform実行関数 ---------------------------------------------------------
-# usage: run_terraform <サブコマンド...>
-# WORKDIR 内で terraform を実行する。失敗時は原因を切り分けて die する。
-run_terraform() {
+#--- Terraform実行関数 (失敗しても終了しない版) --------------------------------
+# usage: run_terraform_raw <サブコマンド...>
+# WORKDIR 内で terraform を実行し、終了コードをそのまま返す。
+# 出力は ${WORKDIR}/terraform_cmd.log に保存する。
+run_terraform_raw() {
     local logfile="${WORKDIR}/terraform_cmd.log"
     log_debug "terraform 実行: terraform -chdir=${WORKDIR} $*"
 
@@ -295,24 +307,44 @@ run_terraform() {
     else
         terraform -chdir="${WORKDIR}" "$@" >"${logfile}" 2>&1 || rc=$?
     fi
+    return "${rc}"
+}
 
+#--- Terraform 失敗時の原因切り分け出力 ----------------------------------------
+# usage: report_terraform_failure <サブコマンド> <終了コード>
+report_terraform_failure() {
+    local subcmd="$1" rc="$2"
+    local logfile="${WORKDIR}/terraform_cmd.log"
+
+    log_error "terraform ${subcmd} が失敗しました (exit=${rc})。"
+    # 失敗原因の切り分け
+    if grep -qiE 'AccessDenied|Access Denied|403' "${logfile}"; then
+        log_error "原因: S3 もしくは assume role の権限不足の可能性があります。"
+    elif grep -qiE 'ExpiredToken|InvalidClientTokenId|no valid credential' "${logfile}"; then
+        log_error "原因: AWS 認証情報が無効または期限切れの可能性があります。aws login --remote を再実行してください。"
+    elif grep -qiE 'NoSuchBucket' "${logfile}"; then
+        log_error "原因: S3 バケットが存在しません。--bucket の指定を確認してください。"
+    elif grep -qiE 'NoSuchKey|Unable to find remote state' "${logfile}"; then
+        log_error "原因: 指定した state key が存在しません。--state-key の指定を確認してください。"
+    elif grep -qiE 'Unable to read remote state|error loading state|failed to load state|state snapshot was created by|Invalid legacy state|state file version|unsupported state' "${logfile}"; then
+        log_error "原因: 対象ファイルが Terraform ステート形式ではない、または未対応のステートバージョンの可能性があります。"
+        log_error "      形式不一致のファイルをスキップして続行する場合は --skip-invalid-state (既定) を使用してください。"
+    elif grep -qiE 'Unsupported argument|Invalid block|Argument or block definition required|Invalid expression' "${logfile}"; then
+        log_error "原因: 生成された、または指定された Terraform コードの構文・引数に問題があります。--debug で生成コードを確認してください。"
+    fi
+    log_error "----- terraform 出力 (末尾20行) -----"
+    tail -n 20 "${logfile}" >&2
+    log_error "-------------------------------------"
+}
+
+#--- Terraform実行関数 ---------------------------------------------------------
+# usage: run_terraform <サブコマンド...>
+# WORKDIR 内で terraform を実行する。失敗時は原因を切り分けて die する。
+run_terraform() {
+    local rc=0
+    run_terraform_raw "$@" || rc=$?
     if [[ ${rc} -ne 0 ]]; then
-        log_error "terraform $1 が失敗しました (exit=${rc})。"
-        # 失敗原因の切り分け
-        if grep -qiE 'AccessDenied|Access Denied|403' "${logfile}"; then
-            log_error "原因: S3 もしくは assume role の権限不足の可能性があります。"
-        elif grep -qiE 'ExpiredToken|InvalidClientTokenId|no valid credential' "${logfile}"; then
-            log_error "原因: AWS 認証情報が無効または期限切れの可能性があります。aws login --remote を再実行してください。"
-        elif grep -qiE 'NoSuchBucket' "${logfile}"; then
-            log_error "原因: S3 バケットが存在しません。--bucket の指定を確認してください。"
-        elif grep -qiE 'NoSuchKey|Unable to find remote state' "${logfile}"; then
-            log_error "原因: 指定した state key が存在しません。--state-key の指定を確認してください。"
-        elif grep -qiE 'Unsupported argument|Invalid block|Argument or block definition required|Invalid expression' "${logfile}"; then
-            log_error "原因: 生成された、または指定された Terraform コードの構文・引数に問題があります。--debug で生成コードを確認してください。"
-        fi
-        log_error "----- terraform 出力 (末尾20行) -----"
-        tail -n 20 "${logfile}" >&2
-        log_error "-------------------------------------"
+        report_terraform_failure "$1" "${rc}"
         exit "${EXIT_TERRAFORM_ERROR}"
     fi
 }
@@ -363,6 +395,8 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
      --state-key を省略すると、バケットに配置されている全ファイルを参照対象に
      terraform_remote_state データソースを一括生成します。
      データソース名は --name-template (既定: INFRA_{dir1}_{dir2}) で決まります。
+     ステートファイル形式に一致しないファイル (ログ・ZIP・lock ファイル等) は
+     自動的にスキップし、残りのファイルで処理 (plan) を続行します。
   いずれのモードでも、以下を組み合わせられます:
      --output-key : 指定キーの値を直接取得
      --search     : キー候補を検索し、番号選択して値を取得
@@ -407,6 +441,15 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
                                csv  : Excel 取り込み向け CSV (.csv, UTF-8 BOM+CRLF)
                                both : text と csv の両方を出力
   --excel                    --report-format csv の別名 (Excel 取り込み向け CSV)
+  --skip-invalid-state       Terraform ステートファイル形式に一致しないファイルを
+                             スキップして処理 (plan) を続行する (既定)。
+                             事前判定 (JSON 構造・version/terraform_version/
+                             serial/lineage の有無) に加え、plan がステート読み取りで
+                             失敗したデータソースも定義から除外して再実行します。
+                             スキップしたファイルは一覧表示し、--output-dir 指定時は
+                             skipped_<日時>.txt / .csv としても出力します。
+  --no-skip-invalid-state    形式に一致しないファイルが1件でもあれば、そこで処理を
+                             中止する (従来動作)。
   --json-expand              output 値が JSON 構造 (オブジェクト/配列) の場合に、
                              JSON のキーと値へ深掘りして表示・出力する。
                              値取得時だけでなく、キー一覧表示時も各キーの値を
@@ -450,6 +493,11 @@ ${SCRIPT_NAME} v${SCRIPT_VERSION}
   ${SCRIPT_NAME} --bucket team-a-tfstate --region ap-northeast-1 \\
       --output-dir ./reports --report-format both
 
+  # 9) バケット内にステート以外のファイルが混在していても止めずに一括参照 (既定動作)
+  #    形式不一致のファイルはスキップされ、一覧とレポートに記録されます
+  ${SCRIPT_NAME} --bucket team-a-tfstate --region ap-northeast-1 \\
+      --skip-invalid-state --output-dir ./reports --report-format both
+
 終了コード:
   0: 正常終了  2: パラメータ不正  3: AWS認証エラー  4: 権限不足
   5: スイッチバック失敗  6: Terraform実行失敗  1: その他のエラー
@@ -481,6 +529,8 @@ parse_args() {
             --report-format)               REPORT_FORMAT="${2:?--report-format に値が必要です}"; shift 2 ;;
             --excel)                       REPORT_FORMAT="csv"; shift ;;
             --json-expand)                 JSON_EXPAND="true"; shift ;;
+            --skip-invalid-state)          SKIP_INVALID_STATE="true"; shift ;;
+            --no-skip-invalid-state)       SKIP_INVALID_STATE="false"; shift ;;
             --debug)                       DEBUG="true"; shift ;;
             --keep-workdir)                KEEP_WORKDIR="true"; shift ;;
             --help|-h)                     usage; exit "${EXIT_OK}" ;;
@@ -707,7 +757,157 @@ build_data_source_name_from_key() {
     printf '%s' "${name}"
 }
 
+#--- スキップしたファイルを記録する --------------------------------------------
+# usage: record_skip <S3キー> <理由>
+record_skip() {
+    local key="$1"
+    local reason="${2:-理由不明}"
+    # 同じキーを二重に記録しない
+    [[ -n "${SKIPPED_REASONS[${key}]:-}" ]] && return 0
+    SKIPPED_KEYS+=("${key}")
+    SKIPPED_REASONS["${key}"]="${reason}"
+}
+
+#--- スキップしたファイルの一覧を表示する --------------------------------------
+print_skipped_summary() {
+    (( ${#SKIPPED_KEYS[@]} == 0 )) && return 0
+    local k
+    echo ""
+    echo "  ▲ スキップしたファイル: ${#SKIPPED_KEYS[@]} 件 (Terraform ステート形式に一致しないため処理対象外)"
+    for k in "${SKIPPED_KEYS[@]}"; do
+        printf '      - %s\n' "${k}"
+        printf '          理由: %s\n' "${SKIPPED_REASONS[${k}]}"
+    done
+}
+
+#--- S3 オブジェクトが Terraform ステート形式かを判定する -----------------------
+# usage: is_terraform_state_object <S3キー>
+# 戻り値: 0 = ステート形式, 1 = ステート形式ではない (理由は SKIP_REASON に設定)
+# オブジェクト全体ではなく先頭 STATE_HEAD_BYTES バイトのみを取得して判定するため、
+# 巨大なステートファイルでも転送量が増えない (読み取り操作のみ)。
+is_terraform_state_object() {
+    local key="$1"
+    local body="${WORKDIR}/state_probe.bin"
+    local errlog="${WORKDIR}/state_probe_err.log"
+    local meta err
+    SKIP_REASON=""
+
+    rm -f -- "${body}"
+    if ! meta="$(aws_cli s3api get-object \
+                     --bucket "${BUCKET}" \
+                     --key "${key}" \
+                     --region "${REGION}" \
+                     --range "bytes=0-$((STATE_HEAD_BYTES - 1))" \
+                     --output json \
+                     "${body}" 2>"${errlog}")"; then
+        err="$(tr '\n' ' ' <"${errlog}")"
+        log_debug "get-object 失敗 (${key}): ${err}"
+        if grep -qiE 'ExpiredToken|InvalidClientTokenId|no valid credential' <<<"${err}"; then
+            die "${EXIT_AUTH_ERROR}" \
+                "AWS 認証情報が無効または期限切れです。aws login --remote を実行してから再度実行してください。"
+        fi
+        if grep -qiE 'InvalidRange|416' <<<"${err}"; then
+            SKIP_REASON="空ファイルのためステートとして読み取れません"
+        elif grep -qiE 'AccessDenied|403|Forbidden' <<<"${err}"; then
+            SKIP_REASON="オブジェクトの読み取り権限がありません (AccessDenied)"
+        elif grep -qiE 'NoSuchKey|404|Not Found' <<<"${err}"; then
+            SKIP_REASON="オブジェクトが存在しません (一覧取得後に削除された可能性があります)"
+        else
+            SKIP_REASON="オブジェクトの取得に失敗しました (--debug で詳細を確認できます)"
+        fi
+        return 1
+    fi
+
+    if [[ ! -s "${body}" ]]; then
+        SKIP_REASON="空ファイルのためステートとして読み取れません"
+        return 1
+    fi
+
+    # JSON オブジェクトで始まらないものはステートファイルではない (バイナリ/テキスト等)
+    local first
+    first="$(head -c 512 "${body}" | tr -d '[:space:]' | head -c 1)"
+    if [[ "${first}" != "{" ]]; then
+        SKIP_REASON="JSON 形式ではありません (Terraform ステートファイルではありません)"
+        return 1
+    fi
+
+    # 取得した範囲がオブジェクト全体かどうかを判定する (ContentRange: bytes 0-N/総サイズ)
+    local range total content_len
+    range="$(jq -r '.ContentRange // ""' <<<"${meta}" 2>/dev/null || true)"
+    content_len="$(jq -r '.ContentLength // 0' <<<"${meta}" 2>/dev/null || true)"
+    total="${range##*/}"
+    [[ "${total}" =~ ^[0-9]+$ ]] || total="${content_len}"
+    [[ "${total}" =~ ^[0-9]+$ ]] || total=0
+    [[ "${content_len}" =~ ^[0-9]+$ ]] || content_len=0
+
+    if (( total > content_len )); then
+        # 全体を取得していない (巨大ステート) 場合は先頭部分の必須項目で判定する
+        if ! grep -qE '"version"[[:space:]]*:' "${body}" \
+           || ! grep -qE '"(terraform_version|lineage|serial)"[[:space:]]*:' "${body}"; then
+            SKIP_REASON="先頭 ${STATE_HEAD_BYTES} バイトに Terraform ステートの必須項目 (version / terraform_version / serial / lineage) が見つかりません"
+            return 1
+        fi
+        return 0
+    fi
+
+    # オブジェクト全体を取得できている場合は JSON として厳密に検証する
+    if ! jq -e . >/dev/null 2>&1 <"${body}"; then
+        SKIP_REASON="JSON として解析できません (破損または別形式のファイル)"
+        return 1
+    fi
+    if ! jq -e 'type == "object" and (.version | type) == "number"
+                and (has("terraform_version") or has("lineage") or has("serial"))' \
+             >/dev/null 2>&1 <"${body}"; then
+        SKIP_REASON="Terraform ステートの必須項目 (version / terraform_version / serial / lineage) がありません"
+        return 1
+    fi
+    local ver
+    ver="$(jq -r '.version' <"${body}" 2>/dev/null || true)"
+    ver="${ver%%.*}"
+    if [[ "${ver}" =~ ^[0-9]+$ ]] && (( ver > STATE_MAX_VERSION )); then
+        SKIP_REASON="未対応のステートフォーマットバージョンです (version=${ver} / 対応: ${STATE_MAX_VERSION} 以下)"
+        return 1
+    fi
+
+    return 0
+}
+
+#--- モードC: 現在の DS_NAMES / DS_S3KEYS から main.tf を書き出す ----------------
+# スキップ判定後や plan 失敗によるデータソース除外後の再生成にも使用する。
+write_main_tf_all_states() {
+    local main_tf="$1"
+    local extra_config name
+    extra_config="$(build_extra_config)"
+
+    cat >"${main_tf}" <<EOF
+#-------------------------------------------------------------
+# ${SCRIPT_NAME} により自動生成 ($(date '+%Y-%m-%d %H:%M:%S'))
+# 他チーム管理のリモートステート読み取り検証用の定義
+# 対象: s3://${BUCKET} 内のステートファイル (${#DS_NAMES[@]} 件)
+# 命名テンプレート: ${NAME_TEMPLATE}
+#-------------------------------------------------------------
+EOF
+
+    for name in "${DS_NAMES[@]}"; do
+        cat >>"${main_tf}" <<EOF
+
+# key: ${DS_S3KEYS[${name}]:-}
+data "terraform_remote_state" "${name}" {
+  backend = "s3"
+
+  config = {
+    bucket = "${BUCKET}"
+    key    = "${DS_S3KEYS[${name}]:-}"
+    region = "${REGION}"${extra_config}
+  }
+}
+EOF
+    done
+}
+
 #--- モードC: バケット内全ファイルのデータソース定義を一括生成する ---------------
+# --skip-invalid-state (既定) の場合、Terraform ステート形式に一致しないファイルは
+# データソース定義に含めず、残りのファイルで処理を続行する。
 generate_main_tf_all_states() {
     local main_tf="$1"
 
@@ -721,24 +921,22 @@ generate_main_tf_all_states() {
         die "${EXIT_GENERIC_ERROR}" \
             "S3 バケット '${BUCKET}' に参照対象のファイルが1件も存在しません。--bucket の指定を確認してください。"
     fi
-    log_info "参照対象ステートファイル: ${total} 件 (命名テンプレート: ${NAME_TEMPLATE})"
-
-    local extra_config
-    extra_config="$(build_extra_config)"
-
-    cat >"${main_tf}" <<EOF
-#-------------------------------------------------------------
-# ${SCRIPT_NAME} により自動生成 ($(date '+%Y-%m-%d %H:%M:%S'))
-# 他チーム管理のリモートステート読み取り検証用の定義
-# 対象: s3://${BUCKET} 内の全ファイル (${total} 件)
-# 命名テンプレート: ${NAME_TEMPLATE}
-#-------------------------------------------------------------
-EOF
+    log_info "バケット内ファイル: ${total} 件 (命名テンプレート: ${NAME_TEMPLATE})"
+    if [[ "${SKIP_INVALID_STATE}" == "true" ]]; then
+        log_info "各ファイルが Terraform ステート形式かを事前確認します (形式不一致はスキップして続行します) ..."
+    fi
 
     local -A used_names=()
     local key name suffix
     while IFS= read -r key; do
-        if [[ "${key}" != *.tfstate ]]; then
+        if [[ "${SKIP_INVALID_STATE}" == "true" ]]; then
+            # ステートファイル形式に一致しないものはスキップして処理を続行する
+            if ! is_terraform_state_object "${key}"; then
+                record_skip "${key}" "${SKIP_REASON}"
+                log_warn "ステート形式に一致しないためスキップします: ${key} (理由: ${SKIP_REASON})"
+                continue
+            fi
+        elif [[ "${key}" != *.tfstate ]]; then
             log_warn "拡張子が .tfstate ではないファイルも参照対象に含めます: ${key} (ステートファイルでない場合は読み取りに失敗します)"
         fi
 
@@ -755,23 +953,17 @@ EOF
         DS_NAMES+=("${name}")
         DS_S3KEYS["${name}"]="${key}"
         log_debug "データソース生成: ${name} <- s3://${BUCKET}/${key}"
-
-        cat >>"${main_tf}" <<EOF
-
-# key: ${key}
-data "terraform_remote_state" "${name}" {
-  backend = "s3"
-
-  config = {
-    bucket = "${BUCKET}"
-    key    = "${key}"
-    region = "${REGION}"${extra_config}
-  }
-}
-EOF
     done < <(jq -r '.[]' <<<"${keys_json}")
 
-    log_info "main.tf を生成しました (データソース ${#DS_NAMES[@]} 件): ${main_tf}"
+    if [[ ${#DS_NAMES[@]} -eq 0 ]]; then
+        log_error "Terraform ステート形式のファイルが 1 件も見つかりませんでした (バケット内 ${total} 件すべてをスキップ)。"
+        print_skipped_summary >&2
+        die "${EXIT_GENERIC_ERROR}" \
+            "参照可能なリモートステートがありません。--bucket の指定、対象ファイルの内容、および s3:GetObject 権限を確認してください。"
+    fi
+
+    write_main_tf_all_states "${main_tf}"
+    log_info "main.tf を生成しました (データソース ${#DS_NAMES[@]} 件 / スキップ ${#SKIPPED_KEYS[@]} 件): ${main_tf}"
 }
 
 #--- main.tf 生成 ---------------------------------------------------------------
@@ -828,6 +1020,8 @@ generate_outputs_tf() {
     local mode="$1"
     local outputs_tf="${WORKDIR}/outputs.tf"
     local name
+    # データソース除外後の再生成で同じモードを再現できるよう保持する
+    OUTPUTS_MODE="${mode}"
 
     {
         cat <<EOF
@@ -891,6 +1085,99 @@ EOF
 # リモートステート操作
 #===============================================================================
 
+#--- plan 失敗時に読み取れなかったデータソース名を terraform 出力から抽出する ---
+# エラーブロック内の "with data.terraform_remote_state.<name>," 行のみを対象にする
+# (警告ブロックや通常の進捗行 "data.terraform_remote_state.X: Reading..." は除外)。
+extract_failed_data_sources() {
+    local logfile="${WORKDIR}/terraform_cmd.log"
+    [[ -f "${logfile}" ]] || return 0
+    awk '
+        /Error:/   { sev = "error" }
+        /Warning:/ { sev = "warning" }
+        sev == "error" && /with[[:space:]]+data\.terraform_remote_state\./ {
+            line = $0
+            sub(/^.*with[[:space:]]+data\.terraform_remote_state\./, "", line)
+            sub(/[^A-Za-z0-9_-].*$/, "", line)
+            if (line != "") print line
+        }
+    ' "${logfile}" 2>/dev/null | sort -u || true
+}
+
+#--- 指定したデータソースを定義から除外する ------------------------------------
+# usage: prune_data_sources <データソース名...>
+prune_data_sources() {
+    local -a drop=("$@")
+    local -a kept=()
+    local name d keep s3key
+    PRUNED_COUNT=0
+
+    for name in "${DS_NAMES[@]}"; do
+        keep="true"
+        for d in "${drop[@]}"; do
+            if [[ "${name}" == "${d}" ]]; then
+                keep="false"
+                break
+            fi
+        done
+        if [[ "${keep}" == "true" ]]; then
+            kept+=("${name}")
+        else
+            s3key="${DS_S3KEYS[${name}]:-${name}}"
+            record_skip "${s3key}" \
+                "terraform plan でリモートステートとして読み取れませんでした (ステート形式不一致・未対応バージョン等の可能性)"
+            log_warn "データソースを除外します: ${name} (key: ${s3key})"
+            unset "DS_S3KEYS[${name}]"
+            PRUNED_COUNT=$((PRUNED_COUNT + 1))
+        fi
+    done
+    DS_NAMES=(${kept[@]+"${kept[@]}"})
+}
+
+#--- plan 実行 (ステートとして読み取れないファイルはスキップして再試行) ---------
+# モードC かつ --skip-invalid-state (既定) の場合、plan がステート読み取りで失敗
+# したデータソースを定義から除外し、残りのデータソースで plan をやり直す。
+# --no-skip-invalid-state 指定時、およびモードA/B では従来どおり最初の失敗で終了する。
+run_plan_skipping_invalid_states() {
+    local planfile="$1"
+    local rc=0 attempt=0
+    local -a failed=()
+
+    while :; do
+        rc=0
+        run_terraform_raw plan -no-color -out="${planfile}" || rc=$?
+        [[ ${rc} -eq 0 ]] && return 0
+
+        if [[ "${SKIP_INVALID_STATE}" != "true" || "${ALL_STATES}" != "true" ]] \
+           || (( attempt >= MAX_PLAN_SKIP_RETRY )); then
+            break
+        fi
+
+        # 失敗したデータソースを特定できない、または全件失敗の場合はスキップできない
+        failed=()
+        mapfile -t failed < <(extract_failed_data_sources)
+        if (( ${#failed[@]} == 0 )) || (( ${#failed[@]} >= ${#DS_NAMES[@]} )); then
+            break
+        fi
+
+        log_warn "ステートとして読み取れないデータソースが ${#failed[@]} 件あります。除外して plan を再実行します。"
+        log_warn "----- terraform 出力 (末尾20行) -----"
+        tail -n 20 "${WORKDIR}/terraform_cmd.log" >&2
+        log_warn "-------------------------------------"
+
+        prune_data_sources "${failed[@]}"
+        if (( PRUNED_COUNT == 0 )); then
+            # 除外対象を定義から特定できなかった場合は再試行しても状況が変わらない
+            break
+        fi
+        write_main_tf_all_states "${WORKDIR}/main.tf"
+        generate_outputs_tf "${OUTPUTS_MODE}"
+        attempt=$((attempt + 1))
+    done
+
+    report_terraform_failure "plan" "${rc}"
+    exit "${EXIT_TERRAFORM_ERROR}"
+}
+
 #--- plan 検証つき apply (読み取り専用の担保) -----------------------------------
 # plan を保存し、リソースの作成・変更・削除が含まれないことを確認してから
 # その plan ファイルのみを apply する。データソースの読み取り (read/no-op) と
@@ -899,7 +1186,7 @@ run_terraform_apply_safely() {
     local planfile="${WORKDIR}/tfplan"
 
     log_info "terraform plan でリソース変更が無いことを確認しています ..."
-    run_terraform plan -no-color -out="${planfile}"
+    run_plan_skipping_invalid_states "${planfile}"
 
     local changes
     changes="$(terraform -chdir="${WORKDIR}" show -json "${planfile}" 2>"${WORKDIR}/show_err.log" \
@@ -1200,6 +1487,46 @@ write_value_report() {
     fi
 }
 
+#--- スキップしたファイルの一覧をファイル出力する ------------------------------
+# --output-dir 指定時のみ、スキップが発生した場合に skipped_<日時>.txt / .csv を出力する。
+write_skipped_report() {
+    [[ -z "${OUTPUT_DIR}" ]] && return 0
+    (( ${#SKIPPED_KEYS[@]} == 0 )) && return 0
+
+    local base="skipped_${RUN_TS}"
+    local k f
+
+    if [[ "${REPORT_FORMAT}" == "text" || "${REPORT_FORMAT}" == "both" ]]; then
+        f="${OUTPUT_DIR}/${base}.txt"
+        {
+            printf '==================================================================\n'
+            printf ' スキップしたファイル一覧 (Terraform ステート形式に不一致)\n'
+            printf '==================================================================\n'
+            printf ' 生成日時      : %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+            [[ -n "${BUCKET}" ]] && printf ' バケット      : s3://%s\n' "${BUCKET}"
+            [[ -n "${REGION}" ]] && printf ' リージョン    : %s\n' "${REGION}"
+            printf ' スキップ件数  : %d 件\n' "${#SKIPPED_KEYS[@]}"
+            printf '%s\n' '------------------------------------------------------------------'
+            for k in "${SKIPPED_KEYS[@]}"; do
+                printf '  - %s\n' "${k}"
+                printf '      理由: %s\n' "${SKIPPED_REASONS[${k}]}"
+            done
+            printf '==================================================================\n'
+        } >"${f}"
+        log_info "スキップ一覧レポートを出力しました: ${f}"
+    fi
+
+    if [[ "${REPORT_FORMAT}" == "csv" || "${REPORT_FORMAT}" == "both" ]]; then
+        f="${OUTPUT_DIR}/${base}.csv"
+        {
+            printf 's3_key,reason\n'
+            for k in "${SKIPPED_KEYS[@]}"; do
+                jq -rn --arg k "${k}" --arg r "${SKIPPED_REASONS[${k}]}" '[$k, $r] | @csv'
+            done
+        } | write_csv_file "${f}"
+    fi
+}
+
 #--- output キー一覧をファイル出力する ----------------------------------------
 # $1: keys_json ({データソース名: [キー一覧]}) / $2: pairs_json ([{ds,key},...])
 # $3: all_outputs_json ({ds: {key: value}})。--json-expand 指定時のみ渡され、値を深掘り出力する。
@@ -1236,6 +1563,9 @@ write_keys_report() {
             [[ -n "${BUCKET}" ]] && printf ' バケット      : s3://%s\n' "${BUCKET}"
             [[ -n "${REGION}" ]] && printf ' リージョン    : %s\n' "${REGION}"
             printf ' データソース  : %d 件 / output キー合計: %d 件\n' "${#DS_NAMES[@]}" "${pair_count}"
+            (( ${#SKIPPED_KEYS[@]} > 0 )) && \
+                printf ' スキップ      : %d 件 (ステート形式に不一致。詳細は skipped_%s.txt)\n' \
+                    "${#SKIPPED_KEYS[@]}" "${RUN_TS}"
             [[ "${expand}" == "true" ]] && printf ' (--json-expand: 値を JSON 深掘り表示)\n'
             local ds_keys ds_key_count
             for name in "${DS_NAMES[@]}"; do
@@ -1362,7 +1692,10 @@ main() {
 
     # リモートステートの実読み取り (init + apply)
     terraform_init_and_read
-    log_info "terraform_remote_state データソースの読み取りに成功しました。"
+    log_info "terraform_remote_state データソースの読み取りに成功しました (データソース ${#DS_NAMES[@]} 件)。"
+    if (( ${#SKIPPED_KEYS[@]} > 0 )); then
+        log_warn "ステート形式に一致しないファイル ${#SKIPPED_KEYS[@]} 件はスキップして処理を続行しました。"
+    fi
 
     # output キー一覧の取得 ({データソース名: [キー一覧]} 形式)
     local keys_json pairs_json pair_count
@@ -1373,6 +1706,8 @@ main() {
 
     if [[ "${pair_count}" -eq 0 ]]; then
         log_warn "対象リモートステートに output が1件も定義されていません。データソース自体の読み取りは成功しています。"
+        print_skipped_summary
+        write_skipped_report
         exit "${EXIT_OK}"
     fi
 
@@ -1421,6 +1756,8 @@ main() {
         echo " terraform_remote_state データソース検証結果: 成功"
         echo "=================================================================="
         echo "  データソース: ${#DS_NAMES[@]} 件 / output キー合計: ${pair_count} 件"
+        (( ${#SKIPPED_KEYS[@]} > 0 )) && \
+            echo "  スキップ    : ${#SKIPPED_KEYS[@]} 件 (Terraform ステート形式に一致しないファイル)"
         [[ "${expand_keys}" == "true" ]] && echo "  (--json-expand: 各キーの値を JSON 深掘り表示)"
         local name ds_keys ds_key_count
         for name in "${DS_NAMES[@]}"; do
@@ -1447,6 +1784,10 @@ main() {
         # ファイル出力 (--output-dir 指定時)
         write_keys_report "${keys_json}" "${pairs_json}" "${all_outputs}"
     fi
+
+    # スキップしたファイルの一覧表示とレポート出力 (発生時のみ)
+    print_skipped_summary
+    write_skipped_report
 
     log_info "処理が正常に完了しました。"
     exit "${EXIT_OK}"

@@ -39,7 +39,32 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 `--state-key` を**省略**すると、リモートステートを管理している S3 バケットに配置されている**全ファイル**を参照対象として、1 ファイルにつき 1 つの `terraform_remote_state` データソースを一括生成します。
 
 - フォルダマーカー(キー末尾が `/` のオブジェクト)は除外されます。
-- 拡張子が `.tfstate` でないファイルも対象に含めますが、その旨を警告表示します(ステートファイルでない場合は読み取りに失敗します)。
+- **Terraform ステートファイルの形式に一致しないファイルは自動的にスキップし、残りのファイルで処理(plan)を続行します**(既定 = `--skip-invalid-state`)。バケットにログ・ZIP・`.tflock` などステート以外のファイルが混在していても、処理全体が失敗しません。
+- スキップしたファイルは理由つきで一覧表示され、`--output-dir` 指定時は `skipped_<日時>.txt` / `.csv` としても出力されます。
+- 従来どおり「形式不一致があればその時点で中止」したい場合は `--no-skip-invalid-state` を指定します。
+
+#### ステート形式の判定とスキップ
+
+スキップ対象の判定は次の 2 段階で行います(いずれも読み取り操作のみ)。
+
+1. **事前判定(データソース生成前)**
+   各オブジェクトの**先頭 128KiB のみ**を `s3api get-object --range` で取得し、Terraform ステートとして妥当かを確認します。
+   全体を取得できた場合は JSON として厳密に検証し、128KiB を超える巨大ステートは先頭部分の必須項目で判定するため、転送量は増えません。
+
+   | スキップ理由 | 判定内容 |
+   |---|---|
+   | JSON 形式ではありません | 先頭が `{` で始まらない(テキスト・バイナリ・ZIP など) |
+   | JSON として解析できません | `{` で始まるが JSON として壊れている |
+   | 必須項目がありません | `version` が数値でない、または `terraform_version` / `serial` / `lineage` がいずれも無い(`.tflock` や一般の JSON ファイルなど) |
+   | 未対応のステートフォーマットバージョン | `version` が 4 を超える(将来フォーマット) |
+   | 空ファイル | サイズ 0 バイト |
+   | 読み取り権限がありません | 当該オブジェクトへの `s3:GetObject` が拒否された |
+
+2. **plan 失敗時の除外・再実行**
+   事前判定を通過しても `terraform plan` がステートとして読み取れなかったデータソースは、terraform の出力から対象を特定して定義から除外し、残りのデータソースで plan をやり直します(最大 10 回)。
+   除外されたファイルもスキップ一覧に記録されます。
+
+> 参照可能なステートが 1 件も残らなかった場合は、スキップ一覧を表示したうえでエラー終了(exit 1)します。
 
 いずれのモードでも、以下を組み合わせられます。
 
@@ -107,6 +132,8 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
 | `--output-dir <dir>` | 結果をレポートファイルとして出力するディレクトリ(存在しない場合は自動作成)。キー一覧・値取得のいずれの結果も内容に応じたレポート形式で出力します。 |
 | `--report-format <fmt>` | `--output-dir` 指定時のファイル形式(既定: `text`)。`text`(整形レポート .txt)/ `csv`(Excel 取り込み向け .csv)/ `both`(両方)。 |
 | `--excel` | `--report-format csv` の別名(Excel 取り込み向け CSV を出力) |
+| `--skip-invalid-state` | Terraform ステートファイル形式に一致しないファイルをスキップして処理(plan)を続行する(**既定**)。スキップしたファイルは理由つきで一覧表示し、`--output-dir` 指定時は `skipped_<日時>.txt` / `.csv` にも出力します。 |
+| `--no-skip-invalid-state` | 形式に一致しないファイルが 1 件でもあれば、そこで処理を中止する(従来動作) |
 | `--json-expand` | output 値が JSON 構造(オブジェクト/配列)の場合に、JSON のキーと値へ深掘りして表示・出力する。値取得時だけでなく、**キー一覧表示時も各キーの値を取得して深掘り表示**します(値は一時ローカルステートのみに書き込まれ終了時に削除)。 |
 | `--debug` | 生成コード・実行コマンド・terraform 出力を表示する |
 | `--keep-workdir` | 終了時に一時作業ディレクトリを削除しない |
@@ -141,6 +168,11 @@ apply が書き込むのは一時作業ディレクトリ内のローカル `ter
     --region ap-northeast-1 --role-arn arn:aws:iam::123456789012:role/tfstate-read \
     --external-id my-external-id \
     --auto-switchback --switchback-shell-path /opt/tools/switchback_aws.sh
+
+# 7) ステート以外のファイルが混在するバケットを一括参照 (形式不一致はスキップ: 既定動作)
+#    スキップしたファイルと理由を skipped_<日時>.txt / .csv にも残す
+./terraform_remote_state_check.sh --bucket team-a-tfstate --region ap-northeast-1 \
+    --output-dir ./reports --report-format both
 ```
 
 ### モードCでの output キー一覧表示・値取得
@@ -242,8 +274,8 @@ CSV 形式かつ `--json-expand` 指定時は、深掘りしたキーパス単�
 2. 必須コマンド(`aws` / `terraform` / `jq` / `mktemp`)の存在確認
 3. AWS 認証確認(`aws sts get-caller-identity`。`aws login --remote` 実施済みかを実 API で確認)
 4. AWS 操作権限確認(S3 head-object / list-objects-v2 / assume-role)。権限不足時は `--auto-switchback` 指定があればスイッチバック用シェルを `source` して再確認
-5. 一時作業ディレクトリに Terraform コードを生成(`main.tf` / `backend_override.tf` / `outputs.tf`)
-6. `terraform init` → `terraform plan`(リソース変更ゼロを検証)→ 検証済み plan の `apply` でリモートステートを実読み取り
+5. 一時作業ディレクトリに Terraform コードを生成(`main.tf` / `backend_override.tf` / `outputs.tf`)。モードCでは生成前に各ファイルがステート形式かを判定し、一致しないものはスキップ
+6. `terraform init` → `terraform plan`(リソース変更ゼロを検証)→ 検証済み plan の `apply` でリモートステートを実読み取り。plan がステート読み取りで失敗した場合、該当データソースを除外して plan を再実行(`--skip-invalid-state` 時)
 7. output キー一覧の表示、または指定・選択されたキーの値を取得して表示(`--json-expand` 指定時は JSON 値をキーパス単位に深掘り)。`--output-dir` 指定時は結果をレポートファイル(text / csv)として出力
 8. 一時作業ディレクトリを削除して終了
 
@@ -263,7 +295,9 @@ CSV 形式かつ `--json-expand` 指定時は、深掘りしたキーパス単�
 
 - **初回実行時**は `--debug --keep-workdir` を付けて、生成された `main.tf` / `outputs.tf` と terraform の出力を確認することを推奨します。
 - `terraform apply` が失敗した場合、ログから原因(権限不足 / 認証期限切れ / バケット・キー不存在 / 構文エラー)を自動で切り分けて表示します。
-- モードCでバケット内にステートファイル以外のファイルが含まれていると読み取り全体が失敗します。その場合は `--state-key` で対象を個別に指定してください。
+- モードCでバケット内にステートファイル以外のファイルが含まれていても、既定(`--skip-invalid-state`)では該当ファイルをスキップして処理を続行します。スキップされたファイルと理由は実行結果の末尾に一覧表示され、`--output-dir` 指定時は `skipped_<日時>.txt` / `.csv` にも出力されます。
+- 意図したステートファイルがスキップされる場合は、`--debug` を付けて判定理由(JSON 形式・必須項目・権限)を確認してください。`s3:GetObject` が拒否されているだけのケースもあります。
+- スキップせずに厳密に検証したい場合は `--no-skip-invalid-state` を指定するか、`--state-key` で対象を個別に指定してください。
 
 ## 変更履歴
 
@@ -273,3 +307,4 @@ CSV 形式かつ `--json-expand` 指定時は、深掘りしたキーパス単�
 | 1.1.0 | 読み取り専用ガードを追加(`backend_override.tf` によるローカルステート強制、`resource` / `module` ブロックを含む .tf の入力拒否、plan のリソース変更ゼロ検証後の apply) |
 | 1.2.0 | バケット全体参照モード(モードC)と命名テンプレート `--name-template`(既定: `INFRA_{dir1}_{dir2}`)を追加 |
 | 1.3.0 | 結果のファイル出力機能を追加。`--output-dir` で出力先を指定し、`--report-format`(`text` / `csv` / `both`)・`--excel` できれいなレポート形式や Excel 取り込み向け CSV(UTF-8 BOM + CRLF)を選択可能に。`--json-expand` で JSON 構造の取得値をキーパス単位に深掘り表示・出力する機能を追加(値取得時に加え、キー一覧表示時も各キーの値を深掘り表示) |
+| 1.4.0 | モードCで Terraform ステートファイル形式に一致しないファイルをスキップして処理(plan)を続行する機能を追加(`--skip-invalid-state` / `--no-skip-invalid-state`)。事前判定(先頭 128KiB の形式チェック)に加え、plan がステート読み取りで失敗したデータソースを除外して再実行。スキップしたファイルは理由つきで一覧表示し、`--output-dir` 指定時は `skipped_<日時>.txt` / `.csv` として出力 |
